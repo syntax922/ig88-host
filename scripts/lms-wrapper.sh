@@ -14,4 +14,11 @@ else
   exit 1
 fi
 
-exec "$LMS_BIN" server start --port 1234 >>"$LOG_DIR/lmstudio.log" 2>&1
+while true; do
+  "$LMS_BIN" server start --port 1234 --log-level info >>"$LOG_DIR/lmstudio.log" 2>&1 || true
+  sleep 5
+  while curl -sf http://127.0.0.1:1234/v1/models >/dev/null 2>&1; do
+    sleep 30
+  done
+  sleep 5
+done
