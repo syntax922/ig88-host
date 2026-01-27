@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.syntax922.ig88.gitops</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/copilot/ig88-host/scripts/gitops-sync.sh</string>
+  </array>
+  <key>UserName</key>
+  <string>copilot</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/copilot/ig88-host</string>
+  <key>StandardOutPath</key>
+  <string>/Users/copilot/ig88-host/logs/gitops.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/copilot/ig88-host/logs/gitops.log</string>
+</dict>
+</plist>

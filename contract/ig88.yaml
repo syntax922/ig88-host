@@ -1,0 +1,6 @@
+backend_host: ig88.cluster.home.arpa
+backend_ip: 10.20.0.26
+backend_port: 11434
+lmstudio_local_port: 1234
+api_base_path: /v1
+healthcheck_path: /v1/models
