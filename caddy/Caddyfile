@@ -4,7 +4,10 @@
   }
 
   handle @allowed {
-    reverse_proxy 127.0.0.1:1234 {
+    # Route through parameter proxy → LM Studio
+    # Proxy clamps Qwen3-Next sampling params (temp, top_p, presence_penalty)
+    # Architecture: Caddy :11434 → Param Proxy :11435 → LM Studio :1234
+    reverse_proxy 127.0.0.1:11435 {
       flush_interval -1
     }
   }
