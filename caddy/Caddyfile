@@ -1,3 +1,12 @@
+{
+  # Disable HTTP/2 cleartext (h2c) — Node.js nghttp2 triggers
+  # NGHTTP2_INTERNAL_ERROR when multiplexed SSE streams reset.
+  # LAN-only proxy; h2c provides no benefit here.
+  servers {
+    protocols h1
+  }
+}
+
 :11434 {
   @allowed {
     remote_ip 127.0.0.1 10.20.0.200 10.20.0.210 10.0.0.0/24
