@@ -44,6 +44,26 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 11435
 REQUEST_TIMEOUT = 300  # seconds (model loading + generation)
 
+# ---------------------------------------------------------------------------
+# Shared HTTP client (connection pooling)
+# ---------------------------------------------------------------------------
+# CRITICAL: Do NOT create a new httpx.Client per request — that opens a new
+# TCP socket every time, and closed sockets linger in TIME_WAIT for 2×MSL
+# (30 s on macOS).  At sustained load the ephemeral port range (16 k ports)
+# is exhausted within hours, making ALL localhost connections fail.
+#
+# A single long-lived client reuses connections via HTTP keep-alive, so only
+# a handful of sockets are ever open to upstream.
+_upstream_client = httpx.Client(
+    base_url=UPSTREAM_URL,
+    timeout=REQUEST_TIMEOUT,
+    limits=httpx.Limits(
+        max_connections=20,
+        max_keepalive_connections=5,
+        keepalive_expiry=30,          # seconds
+    ),
+)
+
 # Models that need parameter clamping (Qwen3-Next & Qwen3.5 architecture, no thinking mode)
 QWEN3_MODELS = frozenset({
     "qwen3-coder-next-mlx",
@@ -74,6 +94,46 @@ RETRY_BACKOFF_BASE = 2.0       # seconds — actual delay = base * (attempt + 1)
 RETRYABLE_STATUS_CODES = {500, 400}
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Health Check (bypass LM Studio event loop)
+# ---------------------------------------------------------------------------
+# LM Studio blocks ALL HTTP requests during inference (single-threaded event
+# loop).  When it is processing a 10-40s chat completion, /v1/models probes
+# timeout.  We cache the last successful /v1/models response and serve it
+# from cache at /healthz so health checks never block on inference.
+
+_health_cache = {
+    "models_json": b'{"status":"ok","cached":true}',
+    "last_success": 0.0,
+    "ttl": 300,  # cache for 5 minutes
+}
+_health_lock = threading.Lock()
+
+
+def update_health_cache(body: bytes):
+    with _health_lock:
+        _health_cache["models_json"] = body
+        _health_cache["last_success"] = time.time()
+
+
+def get_health_response() -> bytes:
+    with _health_lock:
+        age = time.time() - _health_cache["last_success"]
+        if age < _health_cache["ttl"]:
+            return json.dumps({
+                "status": "ok",
+                "upstream": "cached",
+                "cache_age_s": round(age, 1),
+            }).encode("utf-8")
+        else:
+            return json.dumps({
+                "status": "degraded",
+                "upstream": "stale",
+                "cache_age_s": round(age, 1),
+            }).encode("utf-8")
+
+
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -177,19 +237,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _proxy_simple(self, method: str, body: bytes = b""):
         """Non-streaming proxy pass-through."""
         try:
-            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-                resp = client.request(
-                    method,
-                    f"{UPSTREAM_URL}{self.path}",
-                    headers=self._forward_headers(),
-                    content=body,
-                )
-                self.send_response(resp.status_code)
-                for k, v in resp.headers.multi_items():
-                    if k.lower() not in ("transfer-encoding",):
-                        self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(resp.content)
+            resp = _upstream_client.request(
+                method,
+                self.path,
+                headers=self._forward_headers(),
+                content=body,
+            )
+            self.send_response(resp.status_code)
+            for k, v in resp.headers.multi_items():
+                if k.lower() not in ("transfer-encoding",):
+                    self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(resp.content)
+            # Cache successful /v1/models responses for health endpoint
+            if resp.status_code == 200 and "/models" in self.path:
+                update_health_cache(resp.content)
         except Exception as e:
             log.error("Upstream error: %s", e)
             self.send_error(502, f"Upstream error: {e}")
@@ -197,26 +259,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _proxy_stream(self, body: bytes):
         """Streaming proxy for SSE responses (chat completions with stream=true)."""
         try:
-            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-                with client.stream(
-                    "POST",
-                    f"{UPSTREAM_URL}{self.path}",
-                    headers=self._forward_headers(),
-                    content=body,
-                ) as resp:
-                    self.send_response(resp.status_code)
-                    for k, v in resp.headers.multi_items():
-                        if k.lower() not in ("transfer-encoding",):
-                            self.send_header(k, v)
-                    # Signal end-of-response via connection close (we strip
-                    # Transfer-Encoding so the client has no other way to
-                    # detect the stream is complete).
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.close_connection = True
-                    for chunk in resp.iter_bytes():
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+            with _upstream_client.stream(
+                "POST",
+                self.path,
+                headers=self._forward_headers(),
+                content=body,
+            ) as resp:
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.multi_items():
+                    if k.lower() not in ("transfer-encoding",):
+                        self.send_header(k, v)
+                # Signal end-of-response via connection close (we strip
+                # Transfer-Encoding so the client has no other way to
+                # detect the stream is complete).
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                for chunk in resp.iter_bytes():
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
         except Exception as e:
             log.error("Upstream streaming error: %s", e)
             self.send_error(502, f"Upstream streaming error: {e}")
@@ -260,32 +321,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _try_request_with_retry(self, body: bytes, attempt: int) -> str:
         """Non-streaming request with retry check. Returns 'success', 'retry', or 'forwarded'."""
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            resp = client.request(
-                "POST",
-                f"{UPSTREAM_URL}{self.path}",
-                headers=self._forward_headers(),
-                content=body,
-            )
+        resp = _upstream_client.request(
+            "POST",
+            self.path,
+            headers=self._forward_headers(),
+            content=body,
+        )
 
-            if resp.status_code == 200:
-                if attempt > 0:
-                    log.info("Succeeded on retry %d/%d", attempt + 1, MAX_RETRIES + 1)
-                self._send_upstream_response(resp)
-                return "success"
-
-            if _is_retryable_error(resp.status_code, resp.content) and attempt < MAX_RETRIES:
-                delay = RETRY_BACKOFF_BASE * (attempt + 1)
-                log.warning(
-                    "Retryable error (attempt %d/%d): HTTP %d — retrying in %.1fs",
-                    attempt + 1, MAX_RETRIES + 1, resp.status_code, delay,
-                )
-                time.sleep(delay)
-                return "retry"
-
-            # Non-retryable or last retry — forward as-is
+        if resp.status_code == 200:
+            if attempt > 0:
+                log.info("Succeeded on retry %d/%d", attempt + 1, MAX_RETRIES + 1)
             self._send_upstream_response(resp)
-            return "forwarded"
+            return "success"
+
+        if _is_retryable_error(resp.status_code, resp.content) and attempt < MAX_RETRIES:
+            delay = RETRY_BACKOFF_BASE * (attempt + 1)
+            log.warning(
+                "Retryable error (attempt %d/%d): HTTP %d — retrying in %.1fs",
+                attempt + 1, MAX_RETRIES + 1, resp.status_code, delay,
+            )
+            time.sleep(delay)
+            return "retry"
+
+        # Non-retryable or last retry — forward as-is
+        self._send_upstream_response(resp)
+        return "forwarded"
 
     def _try_stream_with_retry(self, body: bytes, attempt: int) -> str:
         """Streaming request with retry check. Returns 'success', 'retry', or 'forwarded'.
@@ -294,43 +354,42 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         If the status is retryable, we consume the error body and return 'retry'
         without having sent anything to the client.
         """
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            with client.stream(
-                "POST",
-                f"{UPSTREAM_URL}{self.path}",
-                headers=self._forward_headers(),
-                content=body,
-            ) as resp:
-                # Check status BEFORE streaming to the client
-                if _is_retryable_error(resp.status_code, b"") and attempt < MAX_RETRIES:
-                    # Consume error body so connection is cleanly closed
-                    try:
-                        resp.read()
-                    except Exception:
-                        pass
-                    delay = RETRY_BACKOFF_BASE * (attempt + 1)
-                    log.warning(
-                        "Retryable stream error (attempt %d/%d): HTTP %d — retrying in %.1fs",
-                        attempt + 1, MAX_RETRIES + 1, resp.status_code, delay,
-                    )
-                    time.sleep(delay)
-                    return "retry"
+        with _upstream_client.stream(
+            "POST",
+            self.path,
+            headers=self._forward_headers(),
+            content=body,
+        ) as resp:
+            # Check status BEFORE streaming to the client
+            if _is_retryable_error(resp.status_code, b"") and attempt < MAX_RETRIES:
+                # Consume error body so connection is cleanly closed
+                try:
+                    resp.read()
+                except Exception:
+                    pass
+                delay = RETRY_BACKOFF_BASE * (attempt + 1)
+                log.warning(
+                    "Retryable stream error (attempt %d/%d): HTTP %d — retrying in %.1fs",
+                    attempt + 1, MAX_RETRIES + 1, resp.status_code, delay,
+                )
+                time.sleep(delay)
+                return "retry"
 
-                # Stream the response to the client
-                if attempt > 0 and resp.status_code == 200:
-                    log.info("Stream succeeded on retry %d/%d", attempt + 1, MAX_RETRIES + 1)
-                self.send_response(resp.status_code)
-                for k, v in resp.headers.multi_items():
-                    if k.lower() not in ("transfer-encoding",):
-                        self.send_header(k, v)
-                # Signal end-of-response via connection close
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.close_connection = True
-                for chunk in resp.iter_bytes():
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                return "success"
+            # Stream the response to the client
+            if attempt > 0 and resp.status_code == 200:
+                log.info("Stream succeeded on retry %d/%d", attempt + 1, MAX_RETRIES + 1)
+            self.send_response(resp.status_code)
+            for k, v in resp.headers.multi_items():
+                if k.lower() not in ("transfer-encoding",):
+                    self.send_header(k, v)
+            # Signal end-of-response via connection close
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            for chunk in resp.iter_bytes():
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            return "success"
 
     def _send_upstream_response(self, resp):
         """Forward an httpx response to the client."""
@@ -357,6 +416,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(error_body)
 
     def do_GET(self):
+        # Health check endpoint -- responds instantly from cache,
+        # never blocks on LM Studio inference.
+        if self.path in ("/healthz", "/health"):
+            body = get_health_response()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Health-Source", "param-proxy-cache")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         log.debug("GET %s", self.path)
         self._proxy_simple("GET")
 
@@ -433,6 +504,9 @@ def main():
     except KeyboardInterrupt:
         log.info("Shutting down")
         server.shutdown()
+    finally:
+        _upstream_client.close()
+        log.info("Upstream connection pool closed")
 
 
 if __name__ == "__main__":
