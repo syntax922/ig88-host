@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 set -euo pipefail
 
 REPO_DIR="/Users/copilot/ig88-host"
@@ -11,5 +11,16 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 
 cd "$REPO_DIR"
+
+PRE_SHA="$(git rev-parse HEAD)"
 git pull --ff-only
-make apply
+POST_SHA="$(git rev-parse HEAD)"
+
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ "$PRE_SHA" != "$POST_SHA" ]; then
+  echo "$TS gitops-sync: pulled $PRE_SHA -> $POST_SHA"
+  echo "  changes need manual apply: run sudo $REPO_DIR/scripts/apply-system.sh"
+  git log --oneline "$PRE_SHA..$POST_SHA"
+else
+  echo "$TS gitops-sync: no changes ($POST_SHA)"
+fi
