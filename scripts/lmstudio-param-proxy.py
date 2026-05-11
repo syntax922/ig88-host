@@ -69,6 +69,7 @@ QWEN3_MODELS = frozenset({
     "qwen3-coder-next-mlx",
     "qwen3-next-80b-a3b-instruct-mlx",
     "qwen3.5-35b-a3b",
+    "qwen3.5-122b-a10b",
 })
 
 # Qwen3-Next recommended non-thinking mode parameters
