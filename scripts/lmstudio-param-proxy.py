@@ -54,14 +54,26 @@ REQUEST_TIMEOUT = 300  # seconds (model loading + generation)
 #
 # A single long-lived client reuses connections via HTTP keep-alive, so only
 # a handful of sockets are ever open to upstream.
+#
+# Stale-keepalive mitigation (2026-05-12): LMStudio appears to close idle
+# keepalive sockets without sending FIN; the next reuse hits a half-open
+# connection and httpx raises an exception whose `str(e)` is empty. The
+# proxy retried with backoff, but every retry hit the same stale pool,
+# producing an outer "Exception (attempt 1/6): — retrying" loop that
+# matched the gateway-side 600s timeout. Two changes:
+#   1. retries=2 on the transport so httpx itself re-establishes the
+#      connection on the half-open detection instead of bubbling up.
+#   2. keepalive_expiry=10 (was 30) so we proactively close idle sockets
+#      well before LMStudio's apparent idle-close threshold.
 _upstream_client = httpx.Client(
     base_url=UPSTREAM_URL,
     timeout=REQUEST_TIMEOUT,
     limits=httpx.Limits(
         max_connections=20,
         max_keepalive_connections=5,
-        keepalive_expiry=30,          # seconds
+        keepalive_expiry=10,          # was 30 — see stale-keepalive note above
     ),
+    transport=httpx.HTTPTransport(retries=2),
 )
 
 # Models that need parameter clamping (Qwen3-Next & Qwen3.5 architecture, no thinking mode)
