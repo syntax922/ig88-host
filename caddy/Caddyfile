@@ -9,7 +9,7 @@
 
 :11434 {
 	@allowed {
-		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.40.0.0/24
+		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24
 	}
 
 	# /lmstudio-api/* → strip prefix → LM Studio direct (bypass param-proxy)
@@ -17,7 +17,7 @@
 	# model load/unload). Param-proxy's Qwen3 sampling clamping is
 	# inappropriate for these endpoints. Per Phase H.3.3 spec §15.4.2.
 	@allowed_lmstudio {
-		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.40.0.0/24
+		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24
 		path /lmstudio-api/*
 	}
 	handle @allowed_lmstudio {
