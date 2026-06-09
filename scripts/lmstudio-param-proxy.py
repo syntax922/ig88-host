@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """LM Studio Inference Parameter Proxy
 
-Ensures optimal sampling parameters for Qwen3-Next models and provides
+Ensures sane sampling parameters for Qwen3-Next models, implements a
+thinking on/off switch the MLX runtime doesn't honor natively, and provides
 automatic retry logic for LM Studio's transient errors during model loading.
 
 Architecture:
   Caddy :11434 → This Proxy :11435 → LM Studio :1234
+
+Two Qwen3 quirks are normalized here (the single layer that owns them):
+  1. Temperature is RESPECTED, not overridden — an explicit value passes through
+     to the model; only a sub-floor value is raised to the Qwen3 minimum (0.6,
+     anti-greedy), and a missing value gets a 0.7 default. (Was: silently forced
+     to 1.0, which ignored the caller.)
+  2. Thinking on/off via `chat_template_kwargs.enable_thinking`. LM Studio/MLX
+     ignores that field, so this proxy implements it: `enable_thinking: false`
+     prefills a closed `<think></think>` assistant turn so the model skips its
+     reasoning preamble (the only reliable no-think lever on this stack). Absent
+     or `true` => native thinking (no behavior change for existing callers).
 
 LM Studio concurrency behaviour (observed empirically):
   - Model already loaded → concurrent requests work fine (serialized internally)
@@ -86,13 +98,24 @@ QWEN3_MODELS = frozenset({
     "qwen3.5-122b-a10b",
 })
 
-# Qwen3-Next recommended non-thinking mode parameters
-QWEN3_OVERRIDES = {
-    "min_temperature": 0.6,       # Floor - never go below this
-    "default_temperature": 0.7,   # Use when client sends < min
-    "max_top_p": 0.8,             # Cap - never go above this
-    "default_top_k": 20,          # Add if missing
-    "default_presence_penalty": 1.0,  # Add if missing/zero
+# Qwen3.5 recommended sampling parameters — MODE-DEPENDENT, straight from the
+# Qwen3.5-35B-A3B model card "Best Practices" (general-task profiles):
+#   non-thinking (instruct): temp 0.7, top_p 0.80, top_k 20, presence_penalty 1.5
+#   thinking:                temp 1.0, top_p 0.95, top_k 20, presence_penalty 1.5
+# (precise-coding thinking is temp 0.6 — callers wanting that send it explicitly.)
+#
+# TRANSPARENCY (2026-06-09): these are DEFAULTS applied only when the caller
+# omits a value. An explicit value is RESPECTED (a caller asking for temp 0.7
+# gets 0.7) — we no longer silently force temperature to 1.0. The one guard is
+# the Qwen3 "DO NOT use greedy decoding" floor: a sub-floor temperature (incl. 0)
+# is raised to MIN_TEMPERATURE (0.6, the lowest Qwen-recommended value), logged.
+MIN_TEMPERATURE = 0.6  # anti-greedy floor for explicit sub-floor temps
+
+QWEN3_DEFAULTS = {
+    # enable_thinking=false (no-think / instruct, general tasks)
+    False: {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "presence_penalty": 1.5},
+    # thinking on (absent switch or true; general tasks) — matches prior live behavior
+    True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
 }
 
 # ---------------------------------------------------------------------------
@@ -217,58 +240,77 @@ logging.basicConfig(
 log = logging.getLogger("param-proxy")
 
 
-def clamp_params(data: dict) -> dict:
-    """Fix sampling parameters for Qwen3-Next models.
+# Closed-thinking prefill. Appended as the final assistant turn so the model
+# treats its <think> block as already complete and emits the answer directly.
+THINK_PREFILL_CONTENT = "<think>\n\n</think>\n\n"
 
-    Only modifies parameters that would cause known issues:
-    - temperature too low -> repetition loops
-    - top_p too high -> no nucleus sampling
-    - missing presence_penalty -> no repetition penalty
+
+def normalize_qwen_request(data: dict) -> dict:
+    """Normalize a Qwen3 chat request: mode-aware sampling defaults + thinking switch.
+
+    Single layer that owns the Qwen3 quirks (the gateway/callers stay clean):
+
+    THINKING SWITCH — `chat_template_kwargs.enable_thinking`. LM Studio's MLX
+    runtime IGNORES that field (verified 2026-06-09; `/no_think` soft-switches are
+    also unsupported on Qwen3.5), so we IMPLEMENT it: `enable_thinking: false`
+    prefills a closed `<think></think>` final assistant turn — the only reliable
+    no-think lever on this stack (the model continues past the closed block and
+    skips its reasoning preamble → clean structured output). Contract, no silent
+    default-flip: ABSENT or `true` => native thinking (unchanged for existing
+    callers); `false` => no-think. The kwarg is consumed + stripped before forward.
+
+    SAMPLING — mode-aware Qwen3.5 model-card defaults, applied ONLY to omitted
+    params (explicit caller values are RESPECTED, not overridden):
+      no-think (instruct, general): temp 0.7, top_p 0.80, top_k 20, pp 1.5
+      thinking      (general):      temp 1.0, top_p 0.95, top_k 20, pp 1.5
+    An explicit sub-floor temperature is raised to MIN_TEMPERATURE (0.6, Qwen3
+    "no greedy decoding") — never silently forced to 1.0.
     """
     model = data.get("model", "")
     if model not in QWEN3_MODELS:
         return data
 
-    original = {
-        "temperature": data.get("temperature"),
-        "top_p": data.get("top_p"),
-        "top_k": data.get("top_k"),
-        "presence_penalty": data.get("presence_penalty"),
-    }
+    # --- thinking mode detection (consume the kwarg) ---
+    ctk = data.get("chat_template_kwargs")
+    enable_thinking = ctk.get("enable_thinking") if isinstance(ctk, dict) else None
+    if "chat_template_kwargs" in data:
+        del data["chat_template_kwargs"]
+    no_think = enable_thinking is False  # absent/true => thinking on
+    defaults = QWEN3_DEFAULTS[not no_think]
 
-    # Temperature: set default if missing, clamp to min 0.6 if too low
+    before = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
+
+    # temperature: respect explicit; default when missing; floor sub-0.6 (anti-greedy)
     temp = data.get("temperature")
-    if temp is None or temp < QWEN3_OVERRIDES["min_temperature"]:
-        data["temperature"] = QWEN3_OVERRIDES["default_temperature"]
-
-    # top_p: set to 0.8 if missing, cap at 0.8 if too high
-    top_p = data.get("top_p")
-    if top_p is None or top_p > QWEN3_OVERRIDES["max_top_p"]:
-        data["top_p"] = QWEN3_OVERRIDES["max_top_p"]
-
-    # top_k: add if missing
+    if temp is None:
+        data["temperature"] = defaults["temperature"]
+    elif temp < MIN_TEMPERATURE:
+        data["temperature"] = MIN_TEMPERATURE
+    # top_p / top_k: respect explicit; default when missing
+    if data.get("top_p") is None:
+        data["top_p"] = defaults["top_p"]
     if "top_k" not in data:
-        data["top_k"] = QWEN3_OVERRIDES["default_top_k"]
+        data["top_k"] = defaults["top_k"]
+    # presence_penalty: fill when missing or zero (zero == no repetition penalty)
+    if data.get("presence_penalty", 0) == 0:
+        data["presence_penalty"] = defaults["presence_penalty"]
 
-    # presence_penalty: add if missing or zero
-    pp = data.get("presence_penalty", 0)
-    if pp == 0:
-        data["presence_penalty"] = QWEN3_OVERRIDES["default_presence_penalty"]
-
-    modified = {
-        "temperature": data.get("temperature"),
-        "top_p": data.get("top_p"),
-        "top_k": data.get("top_k"),
-        "presence_penalty": data.get("presence_penalty"),
-    }
-
-    if original != modified:
+    after = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
+    if before != after:
         log.info(
-            "Clamped params for %s: %s -> %s",
+            "qwen %s [%s]: %s -> %s",
             model,
-            {k: v for k, v in original.items() if v is not None},
-            modified,
+            "no-think" if no_think else "thinking",
+            {k: v for k, v in before.items() if v is not None},
+            after,
         )
+
+    # --- no-think prefill ---
+    if no_think:
+        msgs = data.get("messages")
+        if isinstance(msgs, list) and msgs and msgs[-1].get("role") != "assistant":
+            msgs.append({"role": "assistant", "content": THINK_PREFILL_CONTENT})
+            log.info("no-think: prefilled closed <think> block for %s", model)
 
     return data
 
@@ -535,7 +577,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     family = prompt_family(data)
                 except Exception:
                     family = "nosys"
-                data = clamp_params(data)
+                data = normalize_qwen_request(data)
                 body = json.dumps(data).encode("utf-8")
                 log.info(
                     "POST %s model=%s stream=%s temp=%.2f top_p=%.2f pp=%.1f",
@@ -589,12 +631,11 @@ def main():
     )
     log.info("Qwen3-Next models: %s", ", ".join(sorted(QWEN3_MODELS)))
     log.info(
-        "Clamping: temp>=%.1f, top_p<=%.1f, top_k=%d, presence_penalty=%.1f",
-        QWEN3_OVERRIDES["min_temperature"],
-        QWEN3_OVERRIDES["max_top_p"],
-        QWEN3_OVERRIDES["default_top_k"],
-        QWEN3_OVERRIDES["default_presence_penalty"],
+        "Sampling (defaults applied only when omitted; explicit values respected; floor>=%.1f): "
+        "no-think=%s  thinking=%s",
+        MIN_TEMPERATURE, QWEN3_DEFAULTS[False], QWEN3_DEFAULTS[True],
     )
+    log.info("Thinking: chat_template_kwargs.enable_thinking=false => <think> prefill (no-think); else native")
     log.info(
         "Retry policy: max_retries=%d, backoff_base=%.1fs (no serialization)",
         MAX_RETRIES, RETRY_BACKOFF_BASE,
