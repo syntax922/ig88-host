@@ -42,6 +42,20 @@
 		}
 	}
 
+	# /proxy-metrics → param-proxy in-process family metrics (127.0.0.1:11435).
+	# No strip_prefix: the param-proxy intercepts the literal /proxy-metrics
+	# path in-process (like /healthz), so inference paths stay untouched.
+	# MUST precede @allowed, which matches all paths for allowed IPs.
+	@allowed_proxy_metrics {
+		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24
+		path /proxy-metrics*
+	}
+	handle @allowed_proxy_metrics {
+		reverse_proxy 127.0.0.1:11435 {
+			flush_interval -1
+		}
+	}
+
 	handle @allowed {
 		# Route through parameter proxy → LM Studio
 		# Proxy clamps Qwen3-Next sampling params (temp, top_p, presence_penalty)

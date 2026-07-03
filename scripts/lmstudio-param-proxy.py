@@ -502,9 +502,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Prometheus scrape endpoint — additive, served locally. Reachable
-        # via Caddy at http://10.20.0.26:11434/metrics. Best-effort: any
-        # fault falls through to the normal upstream proxy path.
-        if self.path.split("?", 1)[0] in ("/metrics",):
+        # via Caddy at http://10.20.0.26:11434/proxy-metrics. Best-effort:
+        # any fault falls through to the normal upstream proxy path.
+        if self.path.split("?", 1)[0] in ("/proxy-metrics", "/metrics"):
             try:
                 body = render_family_metrics()
                 self.send_response(200)

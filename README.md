@@ -43,13 +43,27 @@ scrapes them with no new network path:
 | Scrape URL | Source | What it measures |
 |---|---|---|
 | `http://10.20.0.26:11434/cache-metrics` | `scripts/lmstudio-cache-exporter.py` (127.0.0.1:11436) | LM Studio prompt-cache hit rate |
-| `http://10.20.0.26:11434/metrics` | `scripts/lmstudio-param-proxy.py` in-process | Requests + upstream latency, per prompt family |
+| `http://10.20.0.26:11434/proxy-metrics` | `scripts/lmstudio-param-proxy.py` in-process (127.0.0.1:11435) | Requests + upstream latency, per prompt family |
+
+Both underlying listeners are localhost-only (pf allows only :11434 on the LAN),
+reached via dedicated bypass-`handle` routes in the Caddyfile that reuse the
+inference IP allowlist. The `/cache-metrics` route strips its prefix (the
+exporter serves generic `/metrics`); `/proxy-metrics` is passed through
+unstripped and intercepted in-process by the param-proxy, so inference paths are
+never touched.
 
 ### Metrics
 
 **Cache exporter** — tails the LM Studio server log
 (`/Users/copilot/.lmstudio/server-logs/YYYY-MM/YYYY-MM-DD.N.log`) and parses
-`Prompt cache restore:` lines:
+`Prompt cache restore:` lines. These are `DEBUG`-level lines that only appear
+when LM Studio's `verbose: true` logging is on (currently enabled) — if verbose
+is turned off, the cache series go silent (the exporter stays healthy and
+`malformed_lines` stays flat; you just see no new events). A duplicate stream
+also lands in `logs/lmstudio.log` (launchd StandardOut), but the rotated
+server-logs files are the cleaner source and are what the exporter tails.
+Timestamps in the log are local America/Chicago; the exporter ignores them and
+lets Prometheus stamp scrape time.
 
 - `lmstudio_cache_requests_total{hit="cold|partial"}` — cache restore events.
   `cold` = `cached_tokens==0` (nothing reused); `partial` = some prefix reused.
@@ -72,8 +86,19 @@ alters proxied bytes.
 prompt the same way, e.g.
 `python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.read().encode()).hexdigest()[:12])' < prompt.txt`
 (pass the exact system-message string, no trailing newline the caller doesn't
-send). Match against the `family` label. Keep a small hash→caller lookup as
-callers are onboarded.
+send). Match against the `family` label, then extend the lookup below as callers
+are onboarded. Current traffic mix (fill in the hashes once observed):
+
+| `family` | Caller | Path | Approx share |
+|---|---|---|---|
+| _(hash of DA system prompt)_ | DA playthroughs (operator laptop) | direct from `10.40.0.216` | ~58% |
+| _(hash per LiteLLM caller)_ | LiteLLM-routed callers | via LiteLLM inference gateway | ~41% |
+| `nosys` | any request with no leading system message | — | remainder |
+
+The hash is content-addressed, so a caller that changes its system prompt gets a
+new family — expected, and the signal that a prompt changed. `overflow` appearing
+means some caller is emitting non-static system prompts (e.g. an embedded
+timestamp or session id); investigate that caller rather than raising the cap.
 
 ### Deploy (operator)
 
@@ -96,16 +121,23 @@ window. Run on ig88 as `copilot`.
    sudo launchctl kickstart -k system/com.syntax922.ig88.cache-exporter
    ```
 3. Graceful Caddy reload — zero-downtime, in-flight requests preserved (does
-   **not** restart Caddy), publishes the `/cache-metrics` route:
+   **not** restart Caddy), publishes both the `/cache-metrics` and
+   `/proxy-metrics` routes:
    `/Users/copilot/ig88-host/bin/caddy reload --config /Users/copilot/ig88-host/caddy/Caddyfile --adapter caddyfile`
 4. Verify the exporter and cache route now (no restart needed):
    - `curl -s http://127.0.0.1:11436/healthz` → `{"status":"ok",...}`
    - `curl -s http://127.0.0.1:11434/cache-metrics | head` → `lmstudio_cache_*`
-5. **Param-proxy `/metrics` requires restarting param-proxy** to load the new
-   code, which drops in-flight completions. Do this in an idle window only:
+5. **Param-proxy `/proxy-metrics` requires restarting param-proxy** to load the
+   new code, which drops in-flight completions. Do this in an idle window only:
    `sudo launchctl kickstart -k system/com.syntax922.ig88.param-proxy`
-   then verify: `curl -s http://127.0.0.1:11434/metrics | head` → `paramproxy_*`
-   and `make status` shows the `cache-exporter` label.
+   then verify: `curl -s http://127.0.0.1:11434/proxy-metrics | head` →
+   `paramproxy_*`, and `make status` shows the `cache-exporter` label.
+
+> **Daemons live in `/Library/LaunchDaemons/`, not per-user LaunchAgents.**
+> The authoritative running set is the system-domain daemons installed by
+> `apply-system.sh`. Stale per-user copies may exist under
+> `~/Library/LaunchAgents/` — those are **not** the running set; ignore them
+> and manage services via `system/<label>` as above.
 
 > **Exporter counters reset on restart.** It attaches at end-of-log on
 > startup (no history replay), so a restart zeroes the `_total` counters —
