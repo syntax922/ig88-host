@@ -26,12 +26,14 @@ Recommended parameters (non-thinking / instruct-only mode):
   temperature: 0.7, top_p: 0.8, top_k: 20, presence_penalty: 1.0
 """
 
+import hashlib
 import http.server
 import json
 import logging
 import sys
 import time
 import threading
+from collections import defaultdict
 from urllib.parse import urlparse
 
 import httpx
@@ -145,6 +147,64 @@ def get_health_response() -> bytes:
                 "upstream": "stale",
                 "cache_age_s": round(age, 1),
             }).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Per-prompt-family metrics (ADDITIVE, fail-open)
+# ---------------------------------------------------------------------------
+# A "prompt family" is the first 12 hex of sha256 over the system-message
+# content. Each caller ships a distinct static system prompt, so families map
+# ~1:1 to callers (cardinality naturally ~20). All of this is best-effort
+# telemetry — every path is wrapped so a fault here can never alter proxying.
+# A hard cap buckets any overflow (e.g. a caller with a dynamic system prompt)
+# into family="overflow" so the metrics dict / Prometheus can't blow up.
+MAX_FAMILIES = 64
+
+_metrics_lock = threading.Lock()
+_family_requests = defaultdict(int)
+_family_latency_sum = defaultdict(float)
+_family_latency_count = defaultdict(int)
+
+
+def prompt_family(data: dict) -> str:
+    """First 12 hex of sha256 of the system message content, or 'nosys'."""
+    msgs = data.get("messages") or []
+    if not msgs or msgs[0].get("role") != "system":
+        return "nosys"
+    content = msgs[0].get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, sort_keys=True)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+
+
+def record_family(family: str, elapsed: float):
+    with _metrics_lock:
+        if family not in _family_requests and len(_family_requests) >= MAX_FAMILIES:
+            family = "overflow"
+        _family_requests[family] += 1
+        _family_latency_sum[family] += elapsed
+        _family_latency_count[family] += 1
+
+
+def render_family_metrics() -> bytes:
+    with _metrics_lock:
+        requests = dict(_family_requests)
+        lat_sum = dict(_family_latency_sum)
+        lat_count = dict(_family_latency_count)
+    lines = [
+        "# HELP paramproxy_requests_total Chat-completion requests by prompt family.",
+        "# TYPE paramproxy_requests_total counter",
+    ]
+    for fam, n in sorted(requests.items()):
+        lines.append('paramproxy_requests_total{family="%s"} %d' % (fam, n))
+    lines += [
+        "# HELP paramproxy_upstream_seconds Upstream chat-completion latency by prompt family.",
+        "# TYPE paramproxy_upstream_seconds summary",
+    ]
+    for fam in sorted(lat_count):
+        lines.append('paramproxy_upstream_seconds_sum{family="%s"} %g' % (fam, lat_sum[fam]))
+        lines.append('paramproxy_upstream_seconds_count{family="%s"} %d' % (fam, lat_count[fam]))
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 # Logging
@@ -441,6 +501,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # Prometheus scrape endpoint — additive, served locally. Reachable
+        # via Caddy at http://10.20.0.26:11434/metrics. Best-effort: any
+        # fault falls through to the normal upstream proxy path.
+        if self.path.split("?", 1)[0] in ("/metrics",):
+            try:
+                body = render_family_metrics()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            except Exception as e:
+                log.error("metrics render failed: %s", e)
+
         log.debug("GET %s", self.path)
         self._proxy_simple("GET")
 
@@ -450,11 +525,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         is_chat = "/chat/completions" in self.path
         is_stream = False
+        family = "nosys"
 
         if is_chat and body:
             try:
                 data = json.loads(body)
                 is_stream = data.get("stream", False)
+                try:
+                    family = prompt_family(data)
+                except Exception:
+                    family = "nosys"
                 data = clamp_params(data)
                 body = json.dumps(data).encode("utf-8")
                 log.info(
@@ -472,7 +552,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             log.debug("POST %s (passthrough)", self.path)
 
         if is_chat:
-            self._proxy_chat_with_retry(body, is_stream)
+            _t0 = time.monotonic()
+            try:
+                self._proxy_chat_with_retry(body, is_stream)
+            finally:
+                try:
+                    record_family(family, time.monotonic() - _t0)
+                except Exception:
+                    pass
         elif is_stream:
             self._proxy_stream(body)
         else:
