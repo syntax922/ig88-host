@@ -244,6 +244,38 @@ log = logging.getLogger("param-proxy")
 # treats its <think> block as already complete and emits the answer directly.
 THINK_PREFILL_CONTENT = "<think>\n\n</think>\n\n"
 
+# Structured-output grammar-skip mitigation (2026-07-06): LM Studio
+# intermittently fails to APPLY a json_schema/json_object response_format —
+# observed during JIT-load races and under concurrent requests. The response
+# then contains unconstrained text (reasoning preamble, ```json fences,
+# double emission) instead of schema-valid JSON. When the grammar IS applied
+# it constrains from token 0 (thinking is impossible), so non-JSON content on
+# a structured request is a reliable skip signature. We validate and retry.
+GRAMMAR_SKIP_MAX_RETRIES = 2
+
+
+def _json_grammar_skipped(raw: bytes) -> bool:
+    """True when a structured-output completion came back with non-JSON content.
+
+    Conservative: only flags a standard, non-tool-call completion envelope
+    whose string content fails to parse as JSON. Anything unusual (tool
+    calls, empty content, unexpected shape) is forwarded untouched.
+    """
+    try:
+        msg = json.loads(raw)["choices"][0]["message"]
+    except Exception:
+        return False
+    if msg.get("tool_calls"):
+        return False
+    content = msg.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return False
+    try:
+        json.loads(content)
+        return False
+    except ValueError:
+        return True
+
 
 def normalize_qwen_request(data: dict) -> dict:
     """Normalize a Qwen3 chat request: mode-aware sampling defaults + thinking switch.
@@ -270,11 +302,23 @@ def normalize_qwen_request(data: dict) -> dict:
     if model not in QWEN3_MODELS:
         return data
 
-    # --- thinking mode detection (consume the kwarg) ---
+    # --- thinking mode detection (consume the kwarg + client-dialect aliases) ---
+    # Accepted spellings, all consumed + stripped before forwarding (LM Studio
+    # ignores every one of them natively); first explicit boolean wins:
+    #   chat_template_kwargs.enable_thinking   (HF / vLLM chat-template dialect)
+    #   enable_thinking                        (top-level vLLM dialect)
+    #   think                                  (Ollama 0.7+ dialect)
     ctk = data.get("chat_template_kwargs")
-    enable_thinking = ctk.get("enable_thinking") if isinstance(ctk, dict) else None
+    _candidates = (
+        ctk.get("enable_thinking") if isinstance(ctk, dict) else None,
+        data.get("enable_thinking"),
+        data.get("think"),
+    )
     if "chat_template_kwargs" in data:
         del data["chat_template_kwargs"]
+    for _alias in ("enable_thinking", "think"):
+        data.pop(_alias, None)
+    enable_thinking = next((c for c in _candidates if isinstance(c, bool)), None)
     no_think = enable_thinking is False  # absent/true => thinking on
     defaults = QWEN3_DEFAULTS[not no_think]
 
@@ -397,18 +441,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             log.error("Upstream streaming error: %s", e)
             self.send_error(502, f"Upstream streaming error: {e}")
 
-    def _proxy_chat_with_retry(self, body: bytes, is_stream: bool):
+    def _proxy_chat_with_retry(
+        self, body: bytes, is_stream: bool, wants_json: bool = False
+    ):
         """Proxy a chat completion with automatic retry on transient errors.
 
         When LM Studio returns a transient error (500 during JIT loading,
         400 model unloaded), waits with backoff and retries.
         """
+        grammar_state = {"retries": 0}
         for attempt in range(MAX_RETRIES + 1):
             try:
                 if is_stream:
                     result = self._try_stream_with_retry(body, attempt)
                 else:
-                    result = self._try_request_with_retry(body, attempt)
+                    result = self._try_request_with_retry(
+                        body, attempt, wants_json, grammar_state
+                    )
 
                 if result == "success" or result == "forwarded":
                     return
@@ -434,7 +483,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "model_loading_timeout",
         )
 
-    def _try_request_with_retry(self, body: bytes, attempt: int) -> str:
+    def _try_request_with_retry(
+        self,
+        body: bytes,
+        attempt: int,
+        wants_json: bool = False,
+        grammar_state=None,  # dict[str,int] | None (py3.9: no PEP 604)
+    ) -> str:
         """Non-streaming request with retry check. Returns 'success', 'retry', or 'forwarded'."""
         resp = _upstream_client.request(
             "POST",
@@ -444,6 +499,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         )
 
         if resp.status_code == 200:
+            if (
+                wants_json
+                and grammar_state is not None
+                and grammar_state["retries"] < GRAMMAR_SKIP_MAX_RETRIES
+                and _json_grammar_skipped(resp.content)
+            ):
+                grammar_state["retries"] += 1
+                log.warning(
+                    "structured-output grammar skipped by LM Studio "
+                    "(grammar retry %d/%d, attempt %d) -- non-JSON content "
+                    "on a json_schema/json_object request; retrying",
+                    grammar_state["retries"], GRAMMAR_SKIP_MAX_RETRIES,
+                    attempt + 1,
+                )
+                time.sleep(1.0)
+                return "retry"
             if attempt > 0:
                 log.info("Succeeded on retry %d/%d", attempt + 1, MAX_RETRIES + 1)
             self._send_upstream_response(resp)
@@ -568,6 +639,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         is_chat = "/chat/completions" in self.path
         is_stream = False
         family = "nosys"
+        wants_json = False
 
         if is_chat and body:
             try:
@@ -577,6 +649,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     family = prompt_family(data)
                 except Exception:
                     family = "nosys"
+                _rf = data.get("response_format")
+                wants_json = isinstance(_rf, dict) and _rf.get("type") in (
+                    "json_schema",
+                    "json_object",
+                )
                 data = normalize_qwen_request(data)
                 body = json.dumps(data).encode("utf-8")
                 log.info(
@@ -596,7 +673,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if is_chat:
             _t0 = time.monotonic()
             try:
-                self._proxy_chat_with_retry(body, is_stream)
+                self._proxy_chat_with_retry(
+                    body, is_stream, wants_json and not is_stream
+                )
             finally:
                 try:
                     record_family(family, time.monotonic() - _t0)
@@ -635,7 +714,15 @@ def main():
         "no-think=%s  thinking=%s",
         MIN_TEMPERATURE, QWEN3_DEFAULTS[False], QWEN3_DEFAULTS[True],
     )
-    log.info("Thinking: chat_template_kwargs.enable_thinking=false => <think> prefill (no-think); else native")
+    log.info(
+        "Thinking: enable_thinking=false via chat_template_kwargs / top-level / "
+        "Ollama 'think' => <think> prefill (no-think); absent/true => native"
+    )
+    log.info(
+        "Structured-output guard: non-JSON content on a json_schema/json_object "
+        "request retries up to %d times (LM Studio grammar-skip mitigation)",
+        GRAMMAR_SKIP_MAX_RETRIES,
+    )
     log.info(
         "Retry policy: max_retries=%d, backoff_base=%.1fs (no serialization)",
         MAX_RETRIES, RETRY_BACKOFF_BASE,
