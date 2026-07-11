@@ -254,27 +254,121 @@ THINK_PREFILL_CONTENT = "<think>\n\n</think>\n\n"
 GRAMMAR_SKIP_MAX_RETRIES = 2
 
 
-def _json_grammar_skipped(raw: bytes) -> bool:
-    """True when a structured-output completion came back with non-JSON content.
+def _resolve_ref(node, root):
+    """Resolve a local ``$ref`` ("#/$defs/Name") against the schema root."""
+    ref = node.get("$ref") if isinstance(node, dict) else None
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return node
+    cur = root
+    for part in ref[2:].split("/"):
+        if not isinstance(cur, dict) or part not in cur:
+            return node  # unresolvable — treat as opaque, don't reject
+        cur = cur[part]
+    return cur if isinstance(cur, dict) else node
 
-    Conservative: only flags a standard, non-tool-call completion envelope
-    whose string content fails to parse as JSON. Anything unusual (tool
-    calls, empty content, unexpected shape) is forwarded untouched.
+
+def _schema_violation(obj, schema, root):
+    """Minimal structural check: does ``obj`` violate ``schema``?
+
+    Deliberately CONSERVATIVE (a false "violation" would burn a retry on a
+    good response): only enforces the constructs a skipped grammar reliably
+    breaks — unknown keys under ``additionalProperties: False`` (garbage keys
+    like ``'dc": 8, '`` / ``'skill_subtype '`` are the observed skip
+    signature, 2026-07-11 session 38937728), ``required`` keys, gross type
+    mismatches on object/array, and per-item array recursion. Everything not
+    understood (anyOf without a match we can prove, enums, formats, numeric
+    bounds) passes. Returns a short reason string, or None when compliant.
+    """
+    if not isinstance(schema, dict):
+        return None
+    schema = _resolve_ref(schema, root)
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list) and any_of:
+        # Pass when ANY branch is non-violating (pydantic optionals emit
+        # anyOf[X, null]); reject only when every branch violates.
+        reasons = []
+        for branch in any_of:
+            r = _schema_violation(obj, branch, root)
+            if r is None:
+                return None
+            reasons.append(r)
+        return reasons[0]
+    stype = schema.get("type")
+    if stype == "object" or (stype is None and "properties" in schema):
+        if not isinstance(obj, dict):
+            return "expected object, got %s" % type(obj).__name__
+        props = schema.get("properties")
+        if isinstance(props, dict) and schema.get("additionalProperties") is False:
+            unknown = [k for k in obj if k not in props]
+            if unknown:
+                return "unknown key(s) %r under additionalProperties=false" % (
+                    unknown[:3],
+                )
+        for req in schema.get("required") or []:
+            if req not in obj:
+                return "missing required key %r" % req
+        if isinstance(props, dict):
+            for k, v in obj.items():
+                if k in props:
+                    r = _schema_violation(v, props[k], root)
+                    if r:
+                        return r
+        return None
+    if stype == "array":
+        if not isinstance(obj, list):
+            return "expected array, got %s" % type(obj).__name__
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for it in obj:
+                r = _schema_violation(it, items, root)
+                if r:
+                    return r
+        return None
+    if stype == "null" and obj is not None:
+        return "expected null"
+    return None
+
+
+def _json_grammar_skipped(raw: bytes, schema=None):
+    """Reason string when a structured-output completion evaded its grammar.
+
+    Two skip signatures (both observed live on this host):
+    1. Content fails to parse as JSON at all (reasoning preamble, fences,
+       double emission) — the original 2026-07-06 signature.
+    2. Content parses as JSON but VIOLATES the requested json_schema
+       (garbage keys under additionalProperties=false, missing required
+       fields) — an enforced grammar cannot produce this, so it proves the
+       grammar was skipped even though the output is JSON-shaped
+       (2026-07-11, session 38937728: keys ``'dc": 8, '`` /
+       ``'skill_subtype '``). Only checked when the request carried a
+       json_schema (``schema`` is its ``schema`` dict).
+
+    Conservative: only flags a standard, non-tool-call completion envelope.
+    Anything unusual (tool calls, empty content, unexpected shape) is
+    forwarded untouched. Returns None when the response looks compliant.
     """
     try:
         msg = json.loads(raw)["choices"][0]["message"]
     except Exception:
-        return False
+        return None
     if msg.get("tool_calls"):
-        return False
+        return None
     content = msg.get("content")
     if not isinstance(content, str) or not content.strip():
-        return False
+        return None
     try:
-        json.loads(content)
-        return False
+        parsed = json.loads(content)
     except ValueError:
-        return True
+        return "non-JSON content"
+    if isinstance(schema, dict):
+        try:
+            reason = _schema_violation(parsed, schema, schema)
+        except Exception as e:  # never let the checker break the proxy
+            log.warning("schema-violation check errored (forwarding): %s", e)
+            return None
+        if reason:
+            return "schema-invalid JSON (%s)" % reason
+    return None
 
 
 def normalize_qwen_request(data: dict) -> dict:
@@ -442,7 +536,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(502, f"Upstream streaming error: {e}")
 
     def _proxy_chat_with_retry(
-        self, body: bytes, is_stream: bool, wants_json: bool = False
+        self, body: bytes, is_stream: bool, wants_json: bool = False,
+        json_schema=None,  # dict | None (py3.9: no PEP 604)
     ):
         """Proxy a chat completion with automatic retry on transient errors.
 
@@ -456,7 +551,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     result = self._try_stream_with_retry(body, attempt)
                 else:
                     result = self._try_request_with_retry(
-                        body, attempt, wants_json, grammar_state
+                        body, attempt, wants_json, grammar_state, json_schema
                     )
 
                 if result == "success" or result == "forwarded":
@@ -489,6 +584,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         attempt: int,
         wants_json: bool = False,
         grammar_state=None,  # dict[str,int] | None (py3.9: no PEP 604)
+        json_schema=None,  # dict | None — the request's json_schema.schema
     ) -> str:
         """Non-streaming request with retry check. Returns 'success', 'retry', or 'forwarded'."""
         resp = _upstream_client.request(
@@ -499,19 +595,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         )
 
         if resp.status_code == 200:
-            if (
-                wants_json
-                and grammar_state is not None
-                and grammar_state["retries"] < GRAMMAR_SKIP_MAX_RETRIES
-                and _json_grammar_skipped(resp.content)
-            ):
+            skip_reason = None
+            if wants_json and grammar_state is not None:
+                if grammar_state["retries"] < GRAMMAR_SKIP_MAX_RETRIES:
+                    skip_reason = _json_grammar_skipped(resp.content, json_schema)
+            if skip_reason:
                 grammar_state["retries"] += 1
                 log.warning(
                     "structured-output grammar skipped by LM Studio "
-                    "(grammar retry %d/%d, attempt %d) -- non-JSON content "
+                    "(grammar retry %d/%d, attempt %d) -- %s "
                     "on a json_schema/json_object request; retrying",
                     grammar_state["retries"], GRAMMAR_SKIP_MAX_RETRIES,
-                    attempt + 1,
+                    attempt + 1, skip_reason,
                 )
                 time.sleep(1.0)
                 return "retry"
@@ -640,6 +735,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         is_stream = False
         family = "nosys"
         wants_json = False
+        json_schema = None
 
         if is_chat and body:
             try:
@@ -654,6 +750,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "json_schema",
                     "json_object",
                 )
+                if wants_json and _rf.get("type") == "json_schema":
+                    _js = _rf.get("json_schema")
+                    if isinstance(_js, dict) and isinstance(
+                        _js.get("schema"), dict
+                    ):
+                        json_schema = _js["schema"]
                 data = normalize_qwen_request(data)
                 body = json.dumps(data).encode("utf-8")
                 log.info(
@@ -674,7 +776,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             _t0 = time.monotonic()
             try:
                 self._proxy_chat_with_retry(
-                    body, is_stream, wants_json and not is_stream
+                    body, is_stream, wants_json and not is_stream, json_schema
                 )
             finally:
                 try:
