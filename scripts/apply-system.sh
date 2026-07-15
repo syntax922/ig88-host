@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_DIR="/Users/copilot/ig88-host"
 LAUNCH_DAEMONS_DIR="/Library/LaunchDaemons"
-LABELS=(com.syntax922.ig88.lmstudio com.syntax922.ig88.caddy com.syntax922.ig88.gitops com.syntax922.ig88.param-proxy com.syntax922.ig88.cache-exporter com.syntax922.ig88.iogpu-wired-limit)
+LABELS=(com.syntax922.ig88.lmstudio com.syntax922.ig88.mlx-audio com.syntax922.ig88.caddy com.syntax922.ig88.gitops com.syntax922.ig88.param-proxy com.syntax922.ig88.cache-exporter com.syntax922.ig88.iogpu-wired-limit)
 
 if [ "$EUID" -ne 0 ]; then
   echo "run as root: sudo /Users/copilot/ig88-host/scripts/apply-system.sh" >&2

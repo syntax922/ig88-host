@@ -7,6 +7,7 @@ status:
 	@UID_NUM=$$(id -u); \
 	launchctl print system/com.syntax922.ig88.lmstudio || true; \
 	launchctl print system/com.syntax922.ig88.caddy || true; \
+	launchctl print system/com.syntax922.ig88.mlx-audio || true; \
 	launchctl print system/com.syntax922.ig88.gitops || true; \
 	launchctl print system/com.syntax922.ig88.param-proxy || true; \
 	launchctl print system/com.syntax922.ig88.cache-exporter || true

@@ -74,3 +74,25 @@
 		format console
 	}
 }
+
+:8880 {
+	# TTS endpoint (mlx-audio: Kokoro / Qwen3-TTS) for TC-14. Same trust
+	# contract as :11434. Long flush interval irrelevant: responses are
+	# whole WAV bodies (request response_format=wav; mp3 needs ffmpeg
+	# which is intentionally not installed).
+	@allowed {
+		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24
+	}
+	handle @allowed {
+		reverse_proxy 127.0.0.1:18880 {
+			flush_interval -1
+		}
+	}
+	handle {
+		respond "forbidden" 403
+	}
+	log {
+		output file /Users/copilot/ig88-host/logs/caddy-access.log
+		format console
+	}
+}

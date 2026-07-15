@@ -1,0 +1,47 @@
+{
+	# Disable HTTP/2 cleartext (h2c) — Node.js nghttp2 triggers
+	# NGHTTP2_INTERNAL_ERROR when multiplexed SSE streams reset.
+	# LAN-only proxy; h2c provides no benefit here.
+	servers {
+		protocols h1
+	}
+}
+
+:11434 {
+	@allowed {
+		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.40.0.0/24
+	}
+
+	# /lmstudio-api/* → strip prefix → LM Studio direct (bypass param-proxy)
+	# Used by the Studio UI for LM Studio's native admin API (model list,
+	# model load/unload). Param-proxy's Qwen3 sampling clamping is
+	# inappropriate for these endpoints. Per Phase H.3.3 spec §15.4.2.
+	@allowed_lmstudio {
+		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.40.0.0/24
+		path /lmstudio-api/*
+	}
+	handle @allowed_lmstudio {
+		uri strip_prefix /lmstudio-api
+		reverse_proxy 127.0.0.1:1234 {
+			flush_interval -1
+		}
+	}
+
+	handle @allowed {
+		# Route through parameter proxy → LM Studio
+		# Proxy clamps Qwen3-Next sampling params (temp, top_p, presence_penalty)
+		# Architecture: Caddy :11434 → Param Proxy :11435 → LM Studio :1234
+		reverse_proxy 127.0.0.1:11435 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		respond "forbidden" 403
+	}
+
+	log {
+		output file /Users/copilot/ig88-host/logs/caddy-access.log
+		format console
+	}
+}
