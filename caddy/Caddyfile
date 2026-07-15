@@ -81,7 +81,7 @@
 	# whole WAV bodies (request response_format=wav; mp3 needs ffmpeg
 	# which is intentionally not installed).
 	@allowed {
-		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24
+		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24 10.20.0.230 10.20.0.231 172.28.45.4 172.28.45.5 172.28.45.6
 	}
 	handle @allowed {
 		reverse_proxy 127.0.0.1:18880 {
