@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""LM Studio Inference Parameter Proxy
+"""ig88 Inference Parameter Proxy
 
-Ensures sane sampling parameters for Qwen3-Next models, implements a
-thinking on/off switch the MLX runtime doesn't honor natively, and provides
-automatic retry logic for LM Studio's transient errors during model loading.
+Ensures sane sampling parameters for Qwen3-Next / Qwen3.5 models, normalizes the
+thinking on/off switch across client dialects, and provides automatic retry
+logic for transient upstream errors during model loading.
 
-Architecture:
-  Caddy :11434 → This Proxy :11435 → LM Studio :1234
+Architecture (upstream is oMLX since the 2026-07-17 cutover; was LM Studio):
+  Caddy :11434 → This Proxy :11435 → oMLX :8000
 
 Two Qwen3 quirks are normalized here (the single layer that owns them):
   1. Temperature is RESPECTED, not overridden — an explicit value passes through
      to the model; only a sub-floor value is raised to the Qwen3 minimum (0.6,
      anti-greedy), and a missing value gets a 0.7 default. (Was: silently forced
      to 1.0, which ignored the caller.)
-  2. Thinking on/off via `chat_template_kwargs.enable_thinking`. LM Studio/MLX
-     ignores that field, so this proxy implements it: `enable_thinking: false`
-     prefills a closed `<think></think>` assistant turn so the model skips its
-     reasoning preamble (the only reliable no-think lever on this stack). Absent
-     or `true` => native thinking (no behavior change for existing callers).
+  2. Thinking on/off via `chat_template_kwargs.enable_thinking`. oMLX honors this
+     natively (its chat template pre-fills an empty <think></think> when false),
+     so the proxy just RESOLVES the caller's dialect — top-level `enable_thinking`
+     and Ollama `think` are folded into `chat_template_kwargs.enable_thinking` —
+     and FORWARDS it. Absent or `true` => native thinking (unchanged for existing
+     callers); `false` => no-think.
+     History: under LM Studio (which ignored the field) the proxy instead injected
+     a closed-<think> assistant prefill. That hack BROKE oMLX — its template
+     re-opens <think> for the generation turn, so the model resumed reasoning and
+     leaked a plain-text "Thinking Process:" preamble into `content`. Removed.
 
 LM Studio concurrency behaviour (observed empirically):
   - Model already loaded → concurrent requests work fine (serialized internally)
@@ -240,10 +245,6 @@ logging.basicConfig(
 log = logging.getLogger("param-proxy")
 
 
-# Closed-thinking prefill. Appended as the final assistant turn so the model
-# treats its <think> block as already complete and emits the answer directly.
-THINK_PREFILL_CONTENT = "<think>\n\n</think>\n\n"
-
 # Structured-output grammar-skip mitigation (2026-07-06): LM Studio
 # intermittently fails to APPLY a json_schema/json_object response_format —
 # observed during JIT-load races and under concurrent requests. The response
@@ -376,14 +377,14 @@ def normalize_qwen_request(data: dict) -> dict:
 
     Single layer that owns the Qwen3 quirks (the gateway/callers stay clean):
 
-    THINKING SWITCH — `chat_template_kwargs.enable_thinking`. LM Studio's MLX
-    runtime IGNORES that field (verified 2026-06-09; `/no_think` soft-switches are
-    also unsupported on Qwen3.5), so we IMPLEMENT it: `enable_thinking: false`
-    prefills a closed `<think></think>` final assistant turn — the only reliable
-    no-think lever on this stack (the model continues past the closed block and
-    skips its reasoning preamble → clean structured output). Contract, no silent
-    default-flip: ABSENT or `true` => native thinking (unchanged for existing
-    callers); `false` => no-think. The kwarg is consumed + stripped before forward.
+    THINKING SWITCH — `chat_template_kwargs.enable_thinking`. oMLX honors this
+    natively (its chat template emits an empty <think></think> when false), so we
+    RESOLVE the caller's dialect and FORWARD it: top-level `enable_thinking` and
+    Ollama `think` are folded into `chat_template_kwargs.enable_thinking` (oMLX
+    reads it only there). Contract, no silent default-flip: ABSENT or `true` =>
+    native thinking (unchanged for existing callers); `false` => no-think.
+    (Under the retired LM Studio upstream this instead injected a closed-<think>
+    prefill; that hack broke oMLX and was removed — see module docstring.)
 
     SAMPLING — mode-aware Qwen3.5 model-card defaults, applied ONLY to omitted
     params (explicit caller values are RESPECTED, not overridden):
@@ -396,24 +397,35 @@ def normalize_qwen_request(data: dict) -> dict:
     if model not in QWEN3_MODELS:
         return data
 
-    # --- thinking mode detection (consume the kwarg + client-dialect aliases) ---
-    # Accepted spellings, all consumed + stripped before forwarding (LM Studio
-    # ignores every one of them natively); first explicit boolean wins:
+    # --- thinking mode: resolve every client dialect, then FORWARD it to oMLX ---
+    # oMLX honors the switch ONLY as `chat_template_kwargs.enable_thinking` — its
+    # chat template gates on that exact key (empty <think></think> prefill when
+    # false, open <think> when true/absent). The top-level `enable_thinking` and
+    # Ollama `think` dialects are NOT read by oMLX, so we translate whichever the
+    # caller sent into chat_template_kwargs and pass it through. First explicit
+    # boolean wins; other chat_template_kwargs keys the caller sent are preserved.
     #   chat_template_kwargs.enable_thinking   (HF / vLLM chat-template dialect)
     #   enable_thinking                        (top-level vLLM dialect)
     #   think                                  (Ollama 0.7+ dialect)
     ctk = data.get("chat_template_kwargs")
+    ctk = dict(ctk) if isinstance(ctk, dict) else {}
     _candidates = (
-        ctk.get("enable_thinking") if isinstance(ctk, dict) else None,
+        ctk.get("enable_thinking"),
         data.get("enable_thinking"),
         data.get("think"),
     )
-    if "chat_template_kwargs" in data:
-        del data["chat_template_kwargs"]
+    # Strip the non-standard top-level aliases (oMLX ignores them; keep the body clean).
     for _alias in ("enable_thinking", "think"):
         data.pop(_alias, None)
     enable_thinking = next((c for c in _candidates if isinstance(c, bool)), None)
     no_think = enable_thinking is False  # absent/true => thinking on
+    # Forward the resolved switch in the one dialect oMLX's template reads.
+    if enable_thinking is not None:
+        ctk["enable_thinking"] = enable_thinking
+    if ctk:
+        data["chat_template_kwargs"] = ctk
+    elif "chat_template_kwargs" in data:
+        del data["chat_template_kwargs"]
     defaults = QWEN3_DEFAULTS[not no_think]
 
     before = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
@@ -443,12 +455,13 @@ def normalize_qwen_request(data: dict) -> dict:
             after,
         )
 
-    # --- no-think prefill ---
+    # No message prefill: oMLX suppresses thinking natively from the forwarded
+    # chat_template_kwargs.enable_thinking:false above. (The old LM-Studio-only
+    # closed-<think> prefill hack actively BROKE oMLX — its template re-opens
+    # <think> for the generation turn, so the model resumed reasoning and leaked
+    # a plain-text "Thinking Process:" preamble into content. See git history.)
     if no_think:
-        msgs = data.get("messages")
-        if isinstance(msgs, list) and msgs and msgs[-1].get("role") != "assistant":
-            msgs.append({"role": "assistant", "content": THINK_PREFILL_CONTENT})
-            log.info("no-think: prefilled closed <think> block for %s", model)
+        log.info("no-think: forwarded enable_thinking=false for %s", model)
 
     return data
 
