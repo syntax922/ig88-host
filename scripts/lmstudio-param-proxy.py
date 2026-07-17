@@ -53,7 +53,7 @@ import httpx
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-UPSTREAM_URL = "http://127.0.0.1:1234"
+UPSTREAM_URL = "http://127.0.0.1:8000"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 11435
 REQUEST_TIMEOUT = 300  # seconds (model loading + generation)

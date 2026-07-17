@@ -4,3 +4,7 @@ backend_port: 11434
 lmstudio_local_port: 1234
 api_base_path: /v1
 healthcheck_path: /v1/models
+engine: omlx  # qwen-tier served by oMLX 0.5.1 continuous batching (cutover 2026-07-17)
+omlx_local_port: 8000
+max_concurrent_requests: 5  # validated N*=5: 2.16x aggregate vs LM Studio, ~30x better p95 TTFT
+# lmstudio_local_port retained: LM Studio still serves BGE-large embeddings + instant rollback
