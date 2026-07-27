@@ -101,7 +101,13 @@ QWEN3_MODELS = frozenset({
     "qwen3-coder-next-mlx",
     "qwen3-next-80b-a3b-instruct-mlx",
     "qwen3.5-35b-a3b",
-    "qwen3.5-122b-a10b",
+    # "qwen3.5-122b-a10b" DELISTED 2026-07-27: the May-11 clamp rationale
+    # (ffa04db — LM Studio-era tail latencies + generic greedy-repetition
+    # guidance) does not reproduce on oMLX 0.5.1: 400-token pure-greedy prose
+    # (temp 0.0, pp 0.01, thinking off) stops naturally with zero degenerate
+    # loops. Callers (dungeonadventures role profiles) own their sampling for
+    # this model; the proxy no longer second-guesses explicit params. The
+    # wants_json/temp-0 exemption below stays for the legacy members.
 })
 
 # Qwen3.5 recommended sampling parameters — MODE-DEPENDENT, straight from the
