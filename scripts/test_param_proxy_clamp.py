@@ -23,7 +23,8 @@ _SPEC = importlib.util.spec_from_file_location(
 param_proxy = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(param_proxy)
 
-QWEN = "qwen3.5-122b-a10b"          # in QWEN3_MODELS
+QWEN = "qwen3.5-35b-a3b"            # in QWEN3_MODELS (legacy member)
+DELISTED = "qwen3.5-122b-a10b"     # delisted 2026-07-27 — must pass through untouched
 NOT_QWEN = "some-other-model"       # not in QWEN3_MODELS
 
 JSON_SCHEMA_RF = {
@@ -147,3 +148,13 @@ class ClampBehaviour(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class Delisted122b(unittest.TestCase):
+    def test_delisted_model_params_pass_through_untouched(self):
+        body = {"model": DELISTED, "temperature": 0.3, "top_p": 0.1,
+                "top_k": 10, "presence_penalty": 0.0,
+                "messages": []}
+        out = normalize_qwen_request(dict(body))
+        for k in ("temperature", "top_p", "top_k", "presence_penalty"):
+            self.assertEqual(out[k], body[k], f"{k} was modified for delisted model")
