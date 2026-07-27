@@ -885,7 +885,8 @@ def main():
     )
     log.info("Qwen3-Next models: %s", ", ".join(sorted(QWEN3_MODELS)))
     log.info(
-        "Sampling (defaults applied only when omitted; explicit values respected; floor>=%.1f): "
+        "Sampling (defaults applied only when omitted; explicit values respected; floor>=%.1f "
+        "EXCEPT structured-output / explicit temp-0 requests, which are honored as sent): "
         "no-think=%s  thinking=%s",
         MIN_TEMPERATURE, QWEN3_DEFAULTS[False], QWEN3_DEFAULTS[True],
     )
