@@ -12,7 +12,8 @@ Two Qwen3 quirks are normalized here (the single layer that owns them):
   1. Temperature is RESPECTED, not overridden — an explicit value passes through
      to the model; only a sub-floor value is raised to the Qwen3 minimum (0.6,
      anti-greedy), and a missing value gets a 0.7 default. (Was: silently forced
-     to 1.0, which ignored the caller.)
+     to 1.0, which ignored the caller.) A caller asking for DETERMINISTIC output
+     is exempt from the anti-greedy floor entirely — see `greedy_floor_exemption`.
   2. Thinking on/off via `chat_template_kwargs.enable_thinking`. oMLX honors this
      natively (its chat template pre-fills an empty <think></think> when false),
      so the proxy just RESOLVES the caller's dialect — top-level `enable_thinking`
@@ -114,6 +115,15 @@ QWEN3_MODELS = frozenset({
 # gets 0.7) — we no longer silently force temperature to 1.0. The one guard is
 # the Qwen3 "DO NOT use greedy decoding" floor: a sub-floor temperature (incl. 0)
 # is raised to MIN_TEMPERATURE (0.6, the lowest Qwen-recommended value), logged.
+#
+# EXEMPTION (2026-07-27): the floor does NOT apply to structured-output requests
+# or to an explicit temperature of 0 — see `greedy_floor_exemption`. Gating the
+# floor on QWEN3_MODELS membership alone made it a tripwire: adding
+# "qwen3.5-122b-a10b" to the set below (commit ffa04db) silently re-floored a
+# downstream consumer's temp-0 JSON-schema classifier to 0.6 for six days, with
+# no signal anywhere in that consumer's own config. Membership decides WHICH
+# models get Qwen defaults; the REQUEST decides whether determinism was asked
+# for. (droidkluster/Kluster#186, waaseyaalabs/dungeonadventures#1367.)
 MIN_TEMPERATURE = 0.6  # anti-greedy floor for explicit sub-floor temps
 
 QWEN3_DEFAULTS = {
@@ -372,6 +382,50 @@ def _json_grammar_skipped(raw: bytes, schema=None):
     return None
 
 
+def wants_json(data: dict) -> bool:
+    """True when the request asks for structured output.
+
+    Structured output means an OpenAI `response_format` of type `json_schema`
+    or `json_object`. This is a property of the REQUEST, not of the model — it
+    is deliberately independent of QWEN3_MODELS membership.
+    """
+    rf = data.get("response_format")
+    return isinstance(rf, dict) and rf.get("type") in ("json_schema", "json_object")
+
+
+def greedy_floor_exemption(data: dict):
+    """Reason this request is exempt from the anti-greedy temperature floor, or None.
+
+    The Qwen3 "DO NOT use greedy decoding" floor exists to stop repetition loops
+    in free-running PROSE. Two request shapes are asking for the opposite thing
+    and must never be re-floored:
+
+      1. Structured output (`response_format` json_schema / json_object). The
+         decode is schema-constrained, so the repetition-loop failure mode the
+         floor guards against cannot occur; what the caller needs instead is a
+         reproducible parse. Raising temperature here converts a deterministic
+         classifier into a coin flip.
+      2. An explicit `temperature: 0`. That is an unambiguous, deliberate
+         request for greedy decoding. Honour it or reject it — silently serving
+         0.6 while the caller believes it pinned 0 is the worst option, because
+         the caller has no signal that its pin was discarded.
+
+    Gating on the REQUEST rather than on the model allowlist is the point:
+    adding a model to QWEN3_MODELS (a routine tuning edit for prose roles) must
+    never silently re-floor somebody's structured-output call. That regression
+    is exactly what happened between 2026-07-21 and 2026-07-27 — see the
+    "Structured-output / temperature-0 exemption" note below.
+
+    Returns a short reason string (for the log) or None.
+    """
+    if wants_json(data):
+        return "structured-output"
+    temp = data.get("temperature")
+    if isinstance(temp, (int, float)) and not isinstance(temp, bool) and temp == 0:
+        return "explicit-temp-0"
+    return None
+
+
 def normalize_qwen_request(data: dict) -> dict:
     """Normalize a Qwen3 chat request: mode-aware sampling defaults + thinking switch.
 
@@ -391,7 +445,9 @@ def normalize_qwen_request(data: dict) -> dict:
       no-think (instruct, general): temp 0.7, top_p 0.80, top_k 20, pp 1.5
       thinking      (general):      temp 1.0, top_p 0.95, top_k 20, pp 1.5
     An explicit sub-floor temperature is raised to MIN_TEMPERATURE (0.6, Qwen3
-    "no greedy decoding") — never silently forced to 1.0.
+    "no greedy decoding") — never silently forced to 1.0 — UNLESS the request is
+    exempt (structured output, or an explicit temperature of 0). See
+    `greedy_floor_exemption`.
     """
     model = data.get("model", "")
     if model not in QWEN3_MODELS:
@@ -430,12 +486,19 @@ def normalize_qwen_request(data: dict) -> dict:
 
     before = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
 
-    # temperature: respect explicit; default when missing; floor sub-0.6 (anti-greedy)
+    # temperature: respect explicit; default when missing; floor sub-0.6
+    # (anti-greedy) unless the request asked for determinism.
+    exemption = greedy_floor_exemption(data)
     temp = data.get("temperature")
     if temp is None:
         data["temperature"] = defaults["temperature"]
-    elif temp < MIN_TEMPERATURE:
+    elif temp < MIN_TEMPERATURE and exemption is None:
         data["temperature"] = MIN_TEMPERATURE
+    elif temp < MIN_TEMPERATURE:
+        log.info(
+            "greedy-floor exempt (%s): honoring temperature=%s for %s",
+            exemption, temp, model,
+        )
     # top_p / top_k: respect explicit; default when missing
     if data.get("top_p") is None:
         data["top_p"] = defaults["top_p"]
@@ -549,7 +612,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(502, f"Upstream streaming error: {e}")
 
     def _proxy_chat_with_retry(
-        self, body: bytes, is_stream: bool, wants_json: bool = False,
+        self, body: bytes, is_stream: bool, is_json_request: bool = False,
         json_schema=None,  # dict | None (py3.9: no PEP 604)
     ):
         """Proxy a chat completion with automatic retry on transient errors.
@@ -564,7 +627,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     result = self._try_stream_with_retry(body, attempt)
                 else:
                     result = self._try_request_with_retry(
-                        body, attempt, wants_json, grammar_state, json_schema
+                        body, attempt, is_json_request, grammar_state, json_schema
                     )
 
                 if result == "success" or result == "forwarded":
@@ -595,7 +658,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self,
         body: bytes,
         attempt: int,
-        wants_json: bool = False,
+        is_json_request: bool = False,
         grammar_state=None,  # dict[str,int] | None (py3.9: no PEP 604)
         json_schema=None,  # dict | None — the request's json_schema.schema
     ) -> str:
@@ -609,7 +672,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         if resp.status_code == 200:
             skip_reason = None
-            if wants_json and grammar_state is not None:
+            if is_json_request and grammar_state is not None:
                 if grammar_state["retries"] < GRAMMAR_SKIP_MAX_RETRIES:
                     skip_reason = _json_grammar_skipped(resp.content, json_schema)
             if skip_reason:
@@ -747,7 +810,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         is_chat = "/chat/completions" in self.path
         is_stream = False
         family = "nosys"
-        wants_json = False
+        is_json_request = False
         json_schema = None
 
         if is_chat and body:
@@ -759,11 +822,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     family = "nosys"
                 _rf = data.get("response_format")
-                wants_json = isinstance(_rf, dict) and _rf.get("type") in (
-                    "json_schema",
-                    "json_object",
-                )
-                if wants_json and _rf.get("type") == "json_schema":
+                is_json_request = wants_json(data)
+                if is_json_request and _rf.get("type") == "json_schema":
                     _js = _rf.get("json_schema")
                     if isinstance(_js, dict) and isinstance(
                         _js.get("schema"), dict
@@ -789,7 +849,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             _t0 = time.monotonic()
             try:
                 self._proxy_chat_with_retry(
-                    body, is_stream, wants_json and not is_stream, json_schema
+                    body, is_stream, is_json_request and not is_stream, json_schema
                 )
             finally:
                 try:
