@@ -3,7 +3,11 @@ set -euo pipefail
 
 REPO_DIR="/Users/copilot/ig88-host"
 LAUNCH_DAEMONS_DIR="/Library/LaunchDaemons"
-LABELS=(com.syntax922.ig88.lmstudio com.syntax922.ig88.mlx-audio com.syntax922.ig88.caddy com.syntax922.ig88.gitops com.syntax922.ig88.param-proxy com.syntax922.ig88.cache-exporter com.syntax922.ig88.iogpu-wired-limit)
+# RETIRED 2026-07-30: com.syntax922.ig88.lmstudio and .cache-exporter.
+# LM Studio serves nothing since oMLX took the LLMs (2026-07-17) and the
+# embeddings (c6f6ba74); the cache-exporter only tails LM Studio's server log.
+# Their plists stay in launchd/ so rollback is re-adding them here.
+LABELS=(com.syntax922.ig88.mlx-audio com.syntax922.ig88.caddy com.syntax922.ig88.gitops com.syntax922.ig88.param-proxy com.syntax922.ig88.iogpu-wired-limit)
 
 if [ "$EUID" -ne 0 ]; then
   echo "run as root: sudo /Users/copilot/ig88-host/scripts/apply-system.sh" >&2

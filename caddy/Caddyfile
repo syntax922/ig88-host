@@ -12,35 +12,27 @@
 		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24 10.42.0.0/16
 	}
 
-	# /lmstudio-api/* → strip prefix → LM Studio direct (bypass param-proxy)
-	# Used by the Studio UI for LM Studio's native admin API (model list,
-	# model load/unload). Param-proxy's Qwen3 sampling clamping is
-	# inappropriate for these endpoints. Per Phase H.3.3 spec §15.4.2.
-	@allowed_lmstudio {
-		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24 10.42.0.0/16
-		path /lmstudio-api/*
-	}
-	handle @allowed_lmstudio {
-		uri strip_prefix /lmstudio-api
-		reverse_proxy 127.0.0.1:1234 {
-			flush_interval -1
-		}
-	}
-
-	# /cache-metrics* → strip prefix → prompt-cache exporter (127.0.0.1:11436)
-	# Lets cluster Prometheus (which already reaches :11434) scrape LM Studio
-	# prompt-cache stats at http://10.20.0.26:11434/cache-metrics.
-	# MUST precede @allowed, which matches all paths for allowed IPs.
-	@allowed_cache_metrics {
-		remote_ip 127.0.0.1 10.20.0.1 10.20.0.200 10.20.0.210 10.20.0.222 10.20.0.223 10.20.0.224 10.22.0.0/24 10.40.0.0/24 10.42.0.0/16
-		path /cache-metrics*
-	}
-	handle @allowed_cache_metrics {
-		uri strip_prefix /cache-metrics
-		reverse_proxy 127.0.0.1:11436 {
-			flush_interval -1
-		}
-	}
+	# RETIRED 2026-07-30 — /lmstudio-api/* and /cache-metrics*.
+	#
+	# Both routed to LM Studio, which no longer serves anything on this host:
+	# oMLX took the LLMs at the 2026-07-17 cutover and the embeddings with
+	# c6f6ba74 (erlore-embed -> Qwen3-Embedding-0.6B). A live check on
+	# 2026-07-30 found LM Studio holding NO loaded models, idling at 1.3 GB.
+	#
+	#   /lmstudio-api/*  -> LM Studio :1234 native admin API. Its only live
+	#     caller was inference-state-watcher, which polled it 84 times per 11
+	#     real completions and got back "qwen-tier not-loaded" every time —
+	#     true of LM Studio's unloaded copy, misleading about the host. That
+	#     watcher moved to oMLX-only in droidkluster/Kluster#264, which is the
+	#     prerequisite this change waited on.
+	#   /cache-metrics*  -> prompt-cache exporter :11436, which tails LM
+	#     Studio's server log. It already returned nothing, and cluster
+	#     Prometheus had already dropped it (documented 502 in
+	#     servicemonitor-ig88-param-proxy.yaml); only /proxy-metrics is
+	#     carried forward.
+	#
+	# Rollback: the launchd plists are retained in launchd/ — re-add the
+	# labels to apply-system.sh and restore these blocks.
 
 	# /proxy-metrics → param-proxy in-process family metrics (127.0.0.1:11435).
 	# No strip_prefix: the param-proxy intercepts the literal /proxy-metrics
@@ -57,9 +49,10 @@
 	}
 
 	handle @allowed {
-		# Route through parameter proxy → LM Studio
-		# Proxy clamps Qwen3-Next sampling params (temp, top_p, presence_penalty)
-		# Architecture: Caddy :11434 → Param Proxy :11435 → LM Studio :1234
+		# Route through the Qwen param proxy → oMLX.
+		# The proxy supplies Qwen3 sampling defaults for params the caller
+		# OMITS; every explicit value is forwarded unchanged (see #8).
+		# Architecture: Caddy :11434 → qwen-param-proxy :11435 → oMLX :8000
 		reverse_proxy 127.0.0.1:11435 {
 			flush_interval -1
 		}
