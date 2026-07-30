@@ -10,7 +10,7 @@
     <array>
         <string>/usr/bin/python3</string>
         <string>-u</string>
-        <string>/Users/copilot/ig88-host/scripts/lmstudio-param-proxy.py</string>
+        <string>/Users/copilot/ig88-host/scripts/qwen-param-proxy.py</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

@@ -18,7 +18,7 @@ import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location(
-    "param_proxy", os.path.join(_HERE, "lmstudio-param-proxy.py")
+    "param_proxy", os.path.join(_HERE, "qwen-param-proxy.py")
 )
 param_proxy = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(param_proxy)
@@ -111,10 +111,38 @@ class ClampBehaviour(unittest.TestCase):
         out = norm(model=QWEN, temperature=0.2, response_format=JSON_SCHEMA_RF)
         self.assertEqual(out["temperature"], 0.2)
 
-    def test_prose_sub_floor_temp_is_still_floored(self):
-        # The clamp's original purpose, intact.
-        out = norm(model=QWEN, temperature=0.3)
-        self.assertEqual(out["temperature"], param_proxy.MIN_TEMPERATURE)
+    def test_prose_sub_floor_temp_is_warned_but_honored(self):
+        # 2026-07-29: the floor warns, it does not rewrite. An explicit value
+        # is the caller's decision; silently raising it is the #1367 mechanism.
+        with self.assertLogs(param_proxy.log, level="WARNING") as captured:
+            out = norm(model=QWEN, temperature=0.3)
+        self.assertEqual(out["temperature"], 0.3)
+        self.assertIn("below the Qwen anti-greedy floor", captured.output[0])
+
+    def test_explicit_presence_penalty_zero_is_honored(self):
+        # 0.0 == 0 in Python, so the old `data.get("presence_penalty", 0) == 0`
+        # test could not distinguish "no repetition penalty, please" from
+        # "unspecified", and overwrote an explicit 0.0 with 1.5. A repetition
+        # penalty on schema-constrained output fights the schema.
+        out = norm(model=QWEN, presence_penalty=0.0)
+        self.assertEqual(out["presence_penalty"], 0.0)
+
+    def test_presence_penalty_still_defaults_when_omitted(self):
+        out = norm(model=QWEN)
+        self.assertEqual(out["presence_penalty"], 1.5)
+
+    def test_no_explicit_sampling_value_is_ever_rewritten(self):
+        # The contract, asserted directly: whatever the caller sends, survives.
+        sent = {
+            "temperature": 0.15,
+            "top_p": 0.05,
+            "top_k": 3,
+            "presence_penalty": 0.0,
+        }
+        with self.assertLogs(param_proxy.log, level="WARNING"):
+            out = norm(model=QWEN, **sent)
+        for key, value in sent.items():
+            self.assertEqual(out[key], value, f"{key} was rewritten")
 
     def test_prose_defaults_still_fill_when_omitted(self):
         out = norm(model=QWEN, chat_template_kwargs={"enable_thinking": False})

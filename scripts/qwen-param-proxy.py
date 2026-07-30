@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""ig88 Inference Parameter Proxy
+"""ig88 Qwen Parameter Proxy
 
-Ensures sane sampling parameters for Qwen3-Next / Qwen3.5 models, normalizes the
-thinking on/off switch across client dialects, and provides automatic retry
-logic for transient upstream errors during model loading.
+Supplies Qwen3-Next / Qwen3.5 sampling defaults for parameters a caller OMITS,
+normalizes the thinking on/off switch across client dialects, and provides
+retry logic for transient upstream errors during model loading.
 
 Architecture (upstream is oMLX since the 2026-07-17 cutover; was LM Studio):
   Caddy :11434 → This Proxy :11435 → oMLX :8000
 
+THE CONTRACT: every parameter the caller sends is forwarded unchanged. This
+layer fills gaps; it does not have opinions about values you chose. If a value
+looks risky it says so in the log and forwards it anyway.
+
+That contract is not decorative — violating it caused both symptoms of
+waaseyaalabs/dungeonadventures#1367, where a temperature floor and a
+`presence_penalty` sentinel each silently rewrote a deliberate caller value
+with no signal anywhere in the caller's own config.
+
 Two Qwen3 quirks are normalized here (the single layer that owns them):
-  1. Temperature is RESPECTED, not overridden — an explicit value passes through
-     to the model; only a sub-floor value is raised to the Qwen3 minimum (0.6,
-     anti-greedy), and a missing value gets a 0.7 default. (Was: silently forced
-     to 1.0, which ignored the caller.) A caller asking for DETERMINISTIC output
-     is exempt from the anti-greedy floor entirely — see `greedy_floor_exemption`.
+  1. Sampling defaults for omitted temperature / top_p / top_k /
+     presence_penalty, mode-aware (thinking vs no-think). A sub-floor
+     temperature is WARNED about and forwarded as sent — see MIN_TEMPERATURE
+     and `greedy_floor_exemption`, which now only suppresses that warning.
   2. Thinking on/off via `chat_template_kwargs.enable_thinking`. oMLX honors this
      natively (its chat template pre-fills an empty <think></think> when false),
      so the proxy just RESOLVES the caller's dialect — top-level `enable_thinking`
@@ -447,13 +455,14 @@ def normalize_qwen_request(data: dict) -> dict:
     prefill; that hack broke oMLX and was removed — see module docstring.)
 
     SAMPLING — mode-aware Qwen3.5 model-card defaults, applied ONLY to omitted
-    params (explicit caller values are RESPECTED, not overridden):
+    params. **Every explicit caller value is forwarded unchanged**:
       no-think (instruct, general): temp 0.7, top_p 0.80, top_k 20, pp 1.5
       thinking      (general):      temp 1.0, top_p 0.95, top_k 20, pp 1.5
-    An explicit sub-floor temperature is raised to MIN_TEMPERATURE (0.6, Qwen3
-    "no greedy decoding") — never silently forced to 1.0 — UNLESS the request is
-    exempt (structured output, or an explicit temperature of 0). See
-    `greedy_floor_exemption`.
+
+    There is no longer any path by which this function rewrites a value the
+    caller sent. A sub-floor temperature is WARNED about (see MIN_TEMPERATURE)
+    and forwarded as sent; `greedy_floor_exemption` now only suppresses that
+    warning for requests where low temperature is obviously intentional.
     """
     model = data.get("model", "")
     if model not in QWEN3_MODELS:
@@ -492,26 +501,42 @@ def normalize_qwen_request(data: dict) -> dict:
 
     before = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
 
-    # temperature: respect explicit; default when missing; floor sub-0.6
-    # (anti-greedy) unless the request asked for determinism.
-    exemption = greedy_floor_exemption(data)
+    # temperature: respect explicit; default when missing.
+    #
+    # The sub-floor case WARNS, it does not rewrite (2026-07-29). Previously an
+    # explicit sub-0.6 temperature was raised to MIN_TEMPERATURE unless exempt,
+    # which meant the proxy overrode a value the caller had deliberately chosen.
+    # That is the mechanism behind both #1367 symptoms: the exemption list is a
+    # allowlist of situations we happened to think of, and anything we did not
+    # think of got silently rewritten with no signal in the caller's own config.
+    #
+    # The anti-greedy rationale is also weaker than when it was written: on
+    # oMLX 0.5.1, 400-token pure-greedy prose (temp 0.0, pp 0.01, thinking off)
+    # stops naturally with zero degenerate loops — the evidence that delisted
+    # qwen3.5-122b-a10b entirely (dadfe04). Callers own their sampling; the
+    # proxy supplies defaults for what they omit and tells them when a value
+    # looks risky.
     temp = data.get("temperature")
     if temp is None:
         data["temperature"] = defaults["temperature"]
-    elif temp < MIN_TEMPERATURE and exemption is None:
-        data["temperature"] = MIN_TEMPERATURE
-    elif temp < MIN_TEMPERATURE:
-        log.info(
-            "greedy-floor exempt (%s): honoring temperature=%s for %s",
-            exemption, temp, model,
+    elif temp < MIN_TEMPERATURE and greedy_floor_exemption(data) is None:
+        log.warning(
+            "temperature=%s is below the Qwen anti-greedy floor of %s for %s; "
+            "honoring it as sent — watch for repetition loops",
+            temp, MIN_TEMPERATURE, model,
         )
     # top_p / top_k: respect explicit; default when missing
     if data.get("top_p") is None:
         data["top_p"] = defaults["top_p"]
     if "top_k" not in data:
         data["top_k"] = defaults["top_k"]
-    # presence_penalty: fill when missing or zero (zero == no repetition penalty)
-    if data.get("presence_penalty", 0) == 0:
+    # presence_penalty: respect explicit; default when missing.
+    # `is None` (not `== 0`) is load-bearing: 0.0 == 0 is true in Python, so the
+    # old test could not tell "caller asked for no repetition penalty" from
+    # "caller said nothing", and silently overwrote an explicit 0.0 with 1.5.
+    # A repetition penalty on a schema-constrained classifier works directly
+    # against output that must repeat JSON field names.
+    if data.get("presence_penalty") is None:
         data["presence_penalty"] = defaults["presence_penalty"]
 
     after = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
