@@ -43,7 +43,7 @@ scrapes them with no new network path:
 | Scrape URL | Source | What it measures |
 |---|---|---|
 | `http://10.20.0.26:11434/cache-metrics` | `scripts/lmstudio-cache-exporter.py` (127.0.0.1:11436) | LM Studio prompt-cache hit rate |
-| `http://10.20.0.26:11434/proxy-metrics` | `scripts/lmstudio-param-proxy.py` in-process (127.0.0.1:11435) | Requests + upstream latency, per prompt family |
+| `http://10.20.0.26:11434/proxy-metrics` | `scripts/qwen-param-proxy.py` in-process (127.0.0.1:11435) | Requests + upstream latency, per prompt family |
 
 Both underlying listeners are localhost-only (pf allows only :11434 on the LAN),
 reached via dedicated bypass-`handle` routes in the Caddyfile that reuse the
