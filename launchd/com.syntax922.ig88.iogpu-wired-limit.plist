@@ -7,7 +7,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/sbin/sysctl</string>
-    <string>iogpu.wired_limit_mb=90112</string>
+    <string>iogpu.wired_limit_mb=93388</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
