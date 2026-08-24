@@ -70,7 +70,13 @@ import httpx
 UPSTREAM_URL = "http://127.0.0.1:8000"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 11435
-REQUEST_TIMEOUT = 300  # seconds (model loading + generation)
+# 1800 (2026-08-24, was 300): large-context clients spend minutes in
+# prefill before a single token streams, and this timeout bounds the WHOLE
+# request, not just time-to-first-byte. Laptop Claude Code via the LiteLLM
+# gateway was truncated mid-prefill at 321s, surfacing as a Caddy 502 ->
+# LiteLLM BadGatewayError -> a 60s router cooldown on a healthy backend.
+# Keep this >= the gateway-side per-route timeout (currently 1800).
+REQUEST_TIMEOUT = 1800
 
 # ---------------------------------------------------------------------------
 # Shared HTTP client (connection pooling)
