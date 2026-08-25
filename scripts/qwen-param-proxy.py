@@ -123,6 +123,10 @@ QWEN3_MODELS = frozenset({
     # chat_template_kwargs form. Without membership a caller sending the
     # vLLM or Ollama dialect would silently get thinking ON.
     "qwen3.5-27b",
+    # MTP graft on the 4-bit qwen3.5-27b (2026-08-25). Qwen3.5 family,
+    # so it takes the SHARED QWEN3_DEFAULTS -- thinking presence_penalty
+    # 1.5 per the 3.5 card, NOT the 3.8 profile's 0.0.
+    "qwen3.5-27b-mtp",
     "qwen38-27b-4bit",
     # Every other Qwen3.8 id present in ig88's model-dir. None is
     # routed by default today, but an unregistered id serves with no
@@ -195,6 +199,7 @@ QWEN3_DEFAULTS = {
 # drift apart. An explicit caller value always wins; this only fills the gap.
 THINKING_OFF_BY_DEFAULT = frozenset({
     "qwen3.5-27b",
+    "qwen3.5-27b-mtp",
     "qwen38-27b-4bit",
     "qwen38-27b",
     "qwen38-27b-mtp",
