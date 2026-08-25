@@ -166,6 +166,10 @@ QWEN3_MODELS = frozenset({
 # models get Qwen defaults; the REQUEST decides whether determinism was asked
 # for. (droidkluster/Kluster#186, waaseyaalabs/dungeonadventures#1367.)
 MIN_TEMPERATURE = 0.6  # anti-greedy floor for explicit sub-floor temps
+#: At or below this explicit temperature the caller has declared greedy intent;
+#: an omitted presence_penalty is then filled with 0.0 rather than the card's
+#: anti-repetition default (see the fill site in ``normalize_qwen_request``).
+GREEDY_INTENT_TEMPERATURE = 0.05
 
 QWEN3_DEFAULTS = {
     # enable_thinking=false (no-think / instruct, general tasks)
@@ -614,7 +618,25 @@ def normalize_qwen_request(data: dict) -> dict:
     # A repetition penalty on a schema-constrained classifier works directly
     # against output that must repeat JSON field names.
     if data.get("presence_penalty") is None:
-        data["presence_penalty"] = defaults["presence_penalty"]
+        # Greedy intent overrides the card default.  A caller that sent an
+        # explicit temperature at (or effectively at) zero has declared it
+        # wants argmax; the card's anti-repetition presence_penalty (1.5 /
+        # 2.0) still reshapes logits at temp 0 and can flip the argmax on any
+        # repeated token -- exactly the wrong thing for a classifier or a
+        # JSON emitter.  Fill 0.0 instead, and say so.  An explicit
+        # presence_penalty from the caller is untouched either way.
+        # Observed 2026-08-25: bare `temperature: 0` requests were receiving
+        # pp 1.5 (erlore keep-warm, harmless; but the next classifier to do
+        # the same would not be).
+        if temp is not None and temp <= GREEDY_INTENT_TEMPERATURE:
+            data["presence_penalty"] = 0.0
+            log.info(
+                "greedy intent (temperature=%s) for %s: filling presence_penalty=0.0, "
+                "not the card default %s",
+                temp, model, defaults["presence_penalty"],
+            )
+        else:
+            data["presence_penalty"] = defaults["presence_penalty"]
 
     after = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
     if before != after:
