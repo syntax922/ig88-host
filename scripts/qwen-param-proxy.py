@@ -115,6 +115,15 @@ QWEN3_MODELS = frozenset({
     "qwen3-coder-next-mlx",
     "qwen3-next-80b-a3b-instruct-mlx",
     "qwen3.5-35b-a3b",
+    # Added 2026-08-24 with the 122B retirement: qwen-tier now routes to
+    # qwen3.5-27b and the new qwen3.8 tier to qwen38-27b-4bit. Membership is
+    # required for more than sampling defaults -- the thinking-dialect
+    # translation below (enable_thinking / think -> chat_template_kwargs)
+    # also sits behind this gate, and oMLX honors ONLY the
+    # chat_template_kwargs form. Without membership a caller sending the
+    # vLLM or Ollama dialect would silently get thinking ON.
+    "qwen3.5-27b",
+    "qwen38-27b-4bit",
     # "qwen3.5-122b-a10b" DELISTED 2026-07-27: the May-11 clamp rationale
     # (ffa04db — LM Studio-era tail latencies + generic greedy-repetition
     # guidance) does not reproduce on oMLX 0.5.1: 400-token pure-greedy prose
@@ -151,6 +160,41 @@ QWEN3_DEFAULTS = {
     False: {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "presence_penalty": 1.5},
     # thinking on (absent switch or true; general tasks) — matches prior live behavior
     True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+}
+
+# Per-model overrides, for models whose card differs from the shared table above.
+#
+# Qwen3.8-27B specifies presence_penalty 0.0 in THINKING mode; the shared table's
+# 1.5 is the Qwen3.5 value. Non-thinking is identical for both models, so only
+# the thinking row differs. Source model cards:
+#   https://huggingface.co/Qwen/Qwen3.8-27B
+#     thinking     : temp 1.0, top_p 0.95, top_k 20, min_p 0.0, pp 0.0,  rep 1.0
+#     non-thinking : temp 0.7, top_p 0.80, top_k 20, min_p 0.0, pp 1.5, rep 1.0
+#   https://huggingface.co/Qwen/Qwen3.5-27B
+#     thinking     : temp 1.0, top_p 0.95, top_k 20, min_p 0.0, pp 1.5, rep 1.0
+#     non-thinking : temp 0.7, top_p 0.80, top_k 20, min_p 0.0, pp 1.5, rep 1.0
+#
+# min_p (0.0) and repetition_penalty (1.0) are the cards' neutral no-ops and are
+# deliberately NOT injected: min_p is non-standard on the OpenAI-compatible
+# endpoint, and sending an unsupported key risks a 400 for zero behavioral gain.
+# Models whose DEPLOYED default is thinking-OFF (set per model in oMLX's
+# model_settings.json). For these an absent thinking switch means OFF, not ON.
+#
+# This matters twice over. It picks the correct sampling profile -- the
+# non-thinking card values (temp 0.7 / top_p 0.80) rather than the thinking ones
+# (temp 1.0 / top_p 0.95) -- and it makes the proxy FORWARD the resolved switch,
+# so the sampling profile chosen here and the mode oMLX actually runs cannot
+# drift apart. An explicit caller value always wins; this only fills the gap.
+THINKING_OFF_BY_DEFAULT = frozenset({
+    "qwen3.5-27b",
+    "qwen38-27b-4bit",
+})
+
+QWEN3_MODEL_DEFAULTS = {
+    "qwen38-27b-4bit": {
+        False: {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "presence_penalty": 1.5},
+        True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0},
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -495,7 +539,11 @@ def normalize_qwen_request(data: dict) -> dict:
     for _alias in ("enable_thinking", "think"):
         data.pop(_alias, None)
     enable_thinking = next((c for c in _candidates if isinstance(c, bool)), None)
-    no_think = enable_thinking is False  # absent/true => thinking on
+    # Absent switch: fall back to the model's deployed default before deciding
+    # anything else. See THINKING_OFF_BY_DEFAULT above.
+    if enable_thinking is None and model in THINKING_OFF_BY_DEFAULT:
+        enable_thinking = False
+    no_think = enable_thinking is False  # absent => model default; true => on
     # Forward the resolved switch in the one dialect oMLX's template reads.
     if enable_thinking is not None:
         ctk["enable_thinking"] = enable_thinking
@@ -503,7 +551,7 @@ def normalize_qwen_request(data: dict) -> dict:
         data["chat_template_kwargs"] = ctk
     elif "chat_template_kwargs" in data:
         del data["chat_template_kwargs"]
-    defaults = QWEN3_DEFAULTS[not no_think]
+    defaults = QWEN3_MODEL_DEFAULTS.get(model, QWEN3_DEFAULTS)[not no_think]
 
     before = {k: data.get(k) for k in ("temperature", "top_p", "top_k", "presence_penalty")}
 
