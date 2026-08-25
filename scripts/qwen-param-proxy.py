@@ -124,6 +124,14 @@ QWEN3_MODELS = frozenset({
     # vLLM or Ollama dialect would silently get thinking ON.
     "qwen3.5-27b",
     "qwen38-27b-4bit",
+    # Every other Qwen3.8 id present in ig88's model-dir. None is
+    # routed by default today, but an unregistered id serves with no
+    # publisher defaults AND thinking ON (this gate also controls the
+    # thinking-dialect translation), so registering them up front means
+    # a future tier repoint cannot silently reintroduce that.
+    "qwen38-27b",
+    "qwen38-27b-mtp",
+    "qwen38-27b-4bit-mtp",
     # "qwen3.5-122b-a10b" DELISTED 2026-07-27: the May-11 clamp rationale
     # (ffa04db — LM Studio-era tail latencies + generic greedy-repetition
     # guidance) does not reproduce on oMLX 0.5.1: 400-token pure-greedy prose
@@ -188,13 +196,23 @@ QWEN3_DEFAULTS = {
 THINKING_OFF_BY_DEFAULT = frozenset({
     "qwen3.5-27b",
     "qwen38-27b-4bit",
+    "qwen38-27b",
+    "qwen38-27b-mtp",
+    "qwen38-27b-4bit-mtp",
 })
 
+# The Qwen3.8-27B card profile. Shared by every 3.8 build on ig88 --
+# quantization and MTP change the weights, not the recommended sampling.
+_QWEN38_PROFILE = {
+    False: {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "presence_penalty": 1.5},
+    True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0},
+}
+
 QWEN3_MODEL_DEFAULTS = {
-    "qwen38-27b-4bit": {
-        False: {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "presence_penalty": 1.5},
-        True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0},
-    },
+    "qwen38-27b-4bit": _QWEN38_PROFILE,
+    "qwen38-27b-4bit-mtp": _QWEN38_PROFILE,
+    "qwen38-27b": _QWEN38_PROFILE,
+    "qwen38-27b-mtp": _QWEN38_PROFILE,
 }
 
 # ---------------------------------------------------------------------------
