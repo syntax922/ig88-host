@@ -5,6 +5,12 @@
 # these flags snapshots are captured but never retained (hot cache defaults
 # to 0/disabled, no SSD dir configured): 318 stores / 0 restores observed,
 # cached_tokens was 0 on every call, long prompts paid full prefill per turn.
+# 2026-08-26: oMLX 0.6.3rc3. ANE/GPU hybrid prefill is opt-in PER MODEL
+# (qwen35_ane_prefill_enabled in ~/.omlx/model_settings.json; enabled for
+# qwen38-27b-4bit + qwen3.5-27b). There is no serve flag for it; the env below
+# only persists compiled ANE programs across restarts (Apple AOT cache) so
+# model load after a restart skips recompilation.
+export OMLX_QWEN35_ANE_COMPILE_CACHE=1
 exec /Applications/oMLX.app/Contents/MacOS/omlx-cli serve \
   --host 127.0.0.1 --port 8000 \
   --model-dir /Users/copilot/.omlx/models \
