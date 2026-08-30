@@ -16,12 +16,18 @@
 # is fixed upstream. The env below only persists compiled ANE programs
 # (Apple AOT cache); harmless while ANE is off.
 export OMLX_QWEN35_ANE_COMPILE_CACHE=1
+# 2026-08-30: hot tier 8GB -> 2GB, SSD tier 100GB -> 300GB. Flash-Next books
+# ~70GB; with the 8GB hot cache full, usage hit ~78GB against a ~79-81GB sizing
+# target and oMLX throttled every prefill chunk 4096 -> 512..1024 (400-790 tok/s
+# cold, vs ~3.2k solo in Kluster #2088). Residency is carried by the paged SSD
+# cache (2-block restore ~2.4s from SSD); the internal SSD is fast with ~430GiB
+# free. Kluster #2092.
 exec /Applications/oMLX.app/Contents/MacOS/omlx-cli serve \
   --host 127.0.0.1 --port 8000 \
   --model-dir /Users/copilot/.omlx/models \
   --memory-guard aggressive \
   --max-concurrent-requests 5 \
-  --hot-cache-max-size 8GB \
+  --hot-cache-max-size 2GB \
   --paged-ssd-cache-dir /Users/copilot/.omlx/cache \
-  --paged-ssd-cache-max-size 100GB \
+  --paged-ssd-cache-max-size 300GB \
   --log-level info
