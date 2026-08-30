@@ -136,6 +136,13 @@ QWEN3_MODELS = frozenset({
     "qwen38-27b",
     "qwen38-27b-mtp",
     "qwen38-27b-4bit-mtp",
+    # Qwen3.8-Flash-Next REAP-288 (qwen4_exp arch, served on the mlx-vlm path)
+    # -- staged on ig88 2026-08-29, NOT routed by any tier. Registered up front
+    # for exactly the reason given just above: this gate also controls the
+    # thinking-dialect translation, and this model's chat template defaults
+    # thinking ON when `enable_thinking` is undefined (chat_template.jinja:46),
+    # so an unregistered id would serve with thinking ON and no card defaults.
+    "flash-next-reap288",
     # "qwen3.5-122b-a10b" DELISTED 2026-07-27: the May-11 clamp rationale
     # (ffa04db — LM Studio-era tail latencies + generic greedy-repetition
     # guidance) does not reproduce on oMLX 0.5.1: 400-token pure-greedy prose
@@ -208,6 +215,7 @@ THINKING_OFF_BY_DEFAULT = frozenset({
     "qwen38-27b",
     "qwen38-27b-mtp",
     "qwen38-27b-4bit-mtp",
+    "flash-next-reap288",
 })
 
 # The Qwen3.8-27B card profile. Shared by every 3.8 build on ig88 --
@@ -222,6 +230,12 @@ QWEN3_MODEL_DEFAULTS = {
     "qwen38-27b-4bit-mtp": _QWEN38_PROFILE,
     "qwen38-27b": _QWEN38_PROFILE,
     "qwen38-27b-mtp": _QWEN38_PROFILE,
+    # Qwen3.8-Flash-Next REAP-288. The upstream Qwen/Qwen3.8-Flash-Next card's
+    # Best Practices table is byte-identical to the Qwen3.8-27B one (thinking
+    # temp 1.0 / top_p 0.95 / top_k 20 / pp 0.0; non-thinking temp 0.7 /
+    # top_p 0.80 / top_k 20 / pp 1.5), so this shares the profile by source
+    # rather than by family guesswork.
+    "flash-next-reap288": _QWEN38_PROFILE,
 }
 
 # ---------------------------------------------------------------------------
