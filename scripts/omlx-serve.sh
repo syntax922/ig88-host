@@ -22,6 +22,43 @@ export OMLX_QWEN35_ANE_COMPILE_CACHE=1
 # cold, vs ~3.2k solo in Kluster #2088). Residency is carried by the paged SSD
 # cache (2-block restore ~2.4s from SSD); the internal SSD is fast with ~430GiB
 # free. Kluster #2092.
+# 2026-09-07: prefill chunk sizing — lift the band clamp, not the ceiling.
+# Every 8-10k-token prompt logs "Prefill throttled ... chunk 4096 -> 1024"
+# (70-130x/hour). Read against oMLX 0.6.4 scheduler._adaptive_chunk_size the
+# 1024 is NOT the headroom gate, it is the secondary "band clamp":
+#   scheduler ceiling  = min(static 96-4, metal 92, dynamic) - hot-cache
+#                        reservation 2         = 90.00 GiB (log: "ceiling")
+#   sizing target      = 90.00 x 0.925 (aggressive headroom safety)
+#                                              = 83.25 GiB (log: "sizing target")
+#   headroom at 73.3 GiB usage                 =  9.94 GiB
+#   n_fit = 9.94 GiB / per_token (2.6-7.5 MB, x1.3 safety already applied)
+#                                              = 1360 .. 3945 tokens  <- varying
+#   observed output                            = 1024 always          <- clamp
+# The clamp fires when usage >= soft_base x prefill_safe_zone_ratio
+#   = (90 x 0.925) x 0.80 = 66.6 GiB, and a 65 GiB-weights model sits at
+#   73.2-76.9 GiB between chunks, so it fires on every chunk regardless of
+#   headroom. Raising the ratio to 0.95 moves the clamp to 79.1 GiB — above
+#   every sizing-time usage read today (max 76.86) — so n = n_fit and the
+#   predicted-peak gate (current + 1.3 x measured <= 83.25) does the sizing.
+# Expected: 4096 -> ~2048 at the median per_token (4.9 MB), 1344..3936 across
+#   the observed range. NOT a full 4096: that needs 19.2 GiB of headroom, i.e.
+#   usage <= 64.0 GiB, and the weights alone are ~65 GiB. No knob on a 96 GiB
+#   box reaches it (custom tier lowers safety to 0.90 and metal 92 still binds;
+#   wired limit 92 GiB is already over the enforcer's 91.2 GiB jetsam floor;
+#   guard off / prefill_priority=speed run into the abort cap or the Metal wall).
+# Margins kept: sizing target 83.25 < abort cap 85.5 < enforcer hard 87.4 <
+#   Metal wall 92.0. A 2x misprediction on a 2048 chunk peaks ~88.6: request
+#   aborts, Metal does not panic. Why 0.95 and not 0.90 (74.9 GiB: still clamps
+#   on the 76.86 reads) or 0.99 (82.4 GiB: clamp effectively deleted).
+# The key has no serve flag and no admin setter, so it is converged in
+#   ~/.omlx/settings.json here, before exec. Rollback = set 0.80 + kickstart
+#   (reverting this file alone leaves 0.95 persisted). Runbook: README.md
+#   "oMLX prefill chunk sizing".
+OMLX_PREFILL_SAFE_ZONE_RATIO="${OMLX_PREFILL_SAFE_ZONE_RATIO:-0.95}"
+/usr/bin/python3 /Users/copilot/ig88-host/scripts/omlx-settings-patch.py \
+  /Users/copilot/.omlx/settings.json memory.prefill_safe_zone_ratio \
+  "$OMLX_PREFILL_SAFE_ZONE_RATIO" \
+  || echo "omlx-serve: settings patch failed (non-fatal), serving with existing settings.json" >&2
 exec /Applications/oMLX.app/Contents/MacOS/omlx-cli serve \
   --host 127.0.0.1 --port 8000 \
   --model-dir /Users/copilot/.omlx/models \
