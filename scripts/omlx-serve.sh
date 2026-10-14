@@ -54,17 +54,24 @@ export OMLX_QWEN35_ANE_COMPILE_CACHE=1
 #   ~/.omlx/settings.json here, before exec. Rollback = set 0.80 + kickstart
 #   (reverting this file alone leaves 0.95 persisted). Runbook: README.md
 #   "oMLX prefill chunk sizing".
-OMLX_PREFILL_SAFE_ZONE_RATIO="${OMLX_PREFILL_SAFE_ZONE_RATIO:-0.95}"
+OMLX_PREFILL_SAFE_ZONE_RATIO="${OMLX_PREFILL_SAFE_ZONE_RATIO:-0.80}"
 /usr/bin/python3 /Users/copilot/ig88-host/scripts/omlx-settings-patch.py \
   /Users/copilot/.omlx/settings.json memory.prefill_safe_zone_ratio \
   "$OMLX_PREFILL_SAFE_ZONE_RATIO" \
   || echo "omlx-serve: settings patch failed (non-fatal), serving with existing settings.json" >&2
+# 2026-10-14 (oMLX 0.7.1.dev1): the aggressive tier's ceiling is DYNAMIC and
+# twice climbed to 92.3-92.7 GB, above the 92 GB iogpu.wired_limit_mb cap, and
+# a 242k prefill then died with a Metal kIOGPUCommandBufferCallbackErrorOutOfMemory
+# (engine loop error, request aborted, server survived). --memory-guard-gb pins
+# the ceiling (custom tier) so it can never exceed the sysctl cap. 85 was tested
+# 2026-10-14 and was WORSE for 180k (the overshoot is ~8 GB above whatever the
+# ceiling is), so 89 stays; see README "oMLX 0.7.1.dev1".
 exec /Applications/oMLX.app/Contents/MacOS/omlx-cli serve \
   --host 127.0.0.1 --port 8000 \
   --model-dir /Users/copilot/.omlx/models \
-  --memory-guard aggressive \
+  --memory-guard-gb 89 \
   --max-concurrent-requests 5 \
   --hot-cache-max-size 2GB \
   --paged-ssd-cache-dir /Users/copilot/.omlx/cache \
-  --paged-ssd-cache-max-size 300GB \
+  --paged-ssd-cache-max-size 450GB \
   --log-level info
