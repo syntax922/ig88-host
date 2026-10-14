@@ -143,7 +143,124 @@ window. Run on ig88 as `copilot`.
 > startup (no history replay), so a restart zeroes the `_total` counters —
 > expected Prometheus counter-reset semantics; `rate()` handles it.
 
+## oMLX 0.7.1.dev1 (2026-10-14)
+
+ig88 runs **oMLX 0.7.1.dev1** (operator-approved upgrade from 0.6.4 on
+2026-10-14). The 0.6.4 bundle is kept beside it for rollback. Nothing in
+`/Applications/oMLX*.app` is version-controlled.
+
+### Install shape (reusable)
+
+```
+curl -L -o ~/Downloads/oMLX-<v>-macos26-27.dmg \
+  https://github.com/jundot/omlx/releases/download/v<v>/oMLX-<v>-macos26-27.dmg
+hdiutil attach -nobrowse -readonly ~/Downloads/oMLX-<v>-macos26-27.dmg
+sudo cp -R /Volumes/oMLX/oMLX.app /Applications/oMLX-<v>.app
+sudo xattr -dr com.apple.quarantine /Applications/oMLX-<v>.app
+/Applications/oMLX-<v>.app/Contents/MacOS/omlx-cli --version   # proves it runs
+# at active_requests == 0:
+sudo mv /Applications/oMLX.app /Applications/oMLX-<old>.app
+sudo mv /Applications/oMLX-<v>.app /Applications/oMLX.app
+sudo launchctl kickstart -k system/com.syntax922.ig88.omlx
+```
+
+Rollback is the two renames in reverse plus the kickstart. Both pinned
+models load in ~30 s. Every SSD prefix-cache entry is invalidated on the
+first start of a new version (layer-signature change), so first turns are
+cold fleet-wide for a while. The `OMLX_*` env vars exported by
+`scripts/omlx-serve.sh` are ignored by 0.7.x (about 150 were removed).
+
+### What changed, measured with the same scripts
+
+| test | 0.6.4 | 0.7.1.dev1 |
+|---|---|---|
+| greedy 300-token decode | 44 cold / 58 warm tok/s | 61 / 113 tok/s |
+| 180k 4-turn via gateway | turns 3-4 rejected; cold 657 s | all admitted; cold 225 s; cached 5-8 s |
+| 242k 4-turn direct | cold 1125 s | cold 331 s; cached 7-20 s |
+| 2 x 128k concurrent | ~800 s each | ~347 s each |
+
+Production sampling for `flash-next-oq4e-mtp` is the proxy's non-thinking
+profile (temp 0.7 / top_p 0.80 / top_k 20 / presence 1.5), not the 1.0/0.95
+row in the checkpoint's `generation_config.json` (that is the thinking row).
+On that profile decode is ~50 tok/s at 300 tokens with MTP acceptance 55-65 %.
+
+### Memory guard: pinned at 89 GB, and why that is not enough
+
+The `aggressive` tier's ceiling is **dynamic** and twice climbed to 92.3-92.7 GB,
+above the 92 GB `iogpu.wired_limit_mb` cap. `--memory-guard-gb 89` (custom
+tier) pins it. Even pinned, **a cold prefill of >=~180k tokens dies at the
+Metal wall about half the time**, always when it follows another long session:
+
+```
+Emergency memory pressure: aborted 1 in-flight request(s) (current=96.6GB, ceiling=92.7GB)
+[METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+Engine loop error: ...
+```
+
+The server survives and a retry works. The peak overshoots the ceiling by a
+roughly constant ~8 GB (85 GB ceiling -> 93.5 GB peak; 89 -> 96.6), so a
+tighter ceiling does not reach the wall: **85 GB was tested and was worse**
+(180k failed on every turn; 242k became a clean preflight 400). There is no
+max-chunk knob (`prefill_min_chunk_tokens` only). Direct clients get a 500
+with the Metal text; through LiteLLM's `/v1/messages` translation the same
+failure arrives as an **empty 200 or a hang**. The gateway-side
+`claude-local` wrapper therefore defaults to a 128k context.
+
+### MoE expert offload (tested, not enabled)
+
+`moe_expert_offload_enabled: true` with `resident_fraction 0.25` in
+`~/.omlx/model_settings.json` streams three quarters of the 68 GB expert
+tables from SSD: resident memory 73 GB -> 23 GB, loads in 10 s, Lightning MTP
+kept (the MTP head stays resident). With it on, 180k and 242k sessions
+completed every turn with no Metal error. Costs on the production profile:
+decode 50 -> 15-18 tok/s; cold 180k prefill 1305 s; cold 242k 925 s; cached
+turns 6-335 s. Turned back off after the comparison. A middle resident
+fraction (0.5) is untested.
+
+### SSD prefix cache raised 300 -> 450 GB (2026-10-14)
+
+The cache was full (1,782 entries; ~182 GB KV blocks + 118 GB fp32 GDN
+sidecars) before any long-context test: every request stores its blocks at
+4096-token granularity plus a recurrent-state sidecar, with no expiry, only
+LRU at the cap. A cold long turn adds 11-12 GB. LRU keeps a live session's
+blocks (newest) safe, so the raise lowers churn rather than fixing a failure.
+Disk had 260 GB free; 450 leaves ~110 GB. `gdn_sidecar_state_dtype` (fp32)
+could halve the sidecars but is untested for recall on this hybrid model.
+
+### SSD cache janitor (2026-10-14)
+
+oMLX has **no time-based expiry** for the paged SSD cache: every request's
+blocks + GDN sidecar are kept until LRU at the cap, and a layout-signature
+change (version upgrade, offload toggle) marks old entries stale in the index
+**but never deletes the files**, which keep counting toward the cap. Measured
+2026-10-14: 133 GB of the 300 GB cache was dead (620 pre-upgrade blocks,
+71 GB; two dead sidecar signature dirs, 62 GB). Deleted by hand once.
+
+`scripts/omlx-cache-janitor.sh` (launchd
+`com.syntax922.ig88.omlx-cache-janitor`, daily 04:30, runs as `copilot`)
+deletes blocks and sidecars whose **access** time is older than 7 days
+(`OMLX_CACHE_RETENTION_DAYS`). Hits update atime on this volume, so it is
+LRU-by-use; shared prefixes hit daily survive. Safe because oMLX prunes the
+index entry on a miss and rescans at restart. Log:
+`logs/omlx-cache-janitor.log`. `--dry-run` reports without deleting.
+
+### Host-state drift to commit
+
+`scripts/omlx-serve.sh` carries two uncommitted edits (the Sep 10 revert of
+`prefill_safe_zone_ratio` to 0.80 — the 0.95 change below never worked — and
+the `--memory-guard-gb 89` pin). `gitops-sync.sh` pulls `--ff-only`, which
+fails silently once upstream touches that file. `~/.omlx/model_settings.json`
+is still untracked. New files to commit: `scripts/omlx-cache-janitor.sh`,
+`launchd/com.syntax922.ig88.omlx-cache-janitor.plist`, plus the
+`--paged-ssd-cache-max-size 450GB` edit.
+
 ## oMLX prefill chunk sizing (memory guard)
+
+> **Historical (2026-09-07 -> 09-10).** The 0.95 ratio change below did not
+> work: throttles/day were 350 and 820 while it was live vs 180-504 around it,
+> and the chunk stayed 1024. The clamp is `_adaptive_chunk_size`'s
+> predicted-peak gate, not the soft watermark analysed here. Reverted to 0.80 on
+> 2026-09-10 (uncommitted at the time). Kept for the ceiling arithmetic.
 
 Runbook for `scripts/omlx-serve.sh`'s `prefill_safe_zone_ratio` change
 (2026-09-07). All sizes below are GiB; oMLX's log prints GiB and labels it

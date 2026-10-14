@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.syntax922.ig88.omlx-cache-janitor</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/copilot/ig88-host/scripts/omlx-cache-janitor.sh</string></array>
+  <key>UserName</key><string>copilot</string>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>30</integer></dict>
+  <key>StandardOutPath</key><string>/Users/copilot/ig88-host/logs/omlx-cache-janitor.log</string>
+  <key>StandardErrorPath</key><string>/Users/copilot/ig88-host/logs/omlx-cache-janitor.log</string>
+</dict>
+</plist>
