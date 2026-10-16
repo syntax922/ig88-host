@@ -174,6 +174,42 @@ class ClampBehaviour(unittest.TestCase):
             self.assertEqual(out["temperature"], 0.0, "re-floored for %s" % model)
 
 
+
+class OmlxBuildInfo(unittest.TestCase):
+    def setUp(self):
+        param_proxy._omlx_status.update({"version": None, "fetched_at": 0.0, "ok": False})
+
+    def test_version_rendered_and_cached(self):
+        calls = []
+        def get():
+            calls.append(1)
+            return {"status": "ok", "version": "0.7.1.dev1"}
+        st = param_proxy.refresh_omlx_status(get=get, now=1000.0)
+        param_proxy.refresh_omlx_status(get=get, now=1030.0)
+        self.assertEqual(len(calls), 1, "second read inside the TTL must hit the cache")
+        lines = param_proxy.render_omlx_metrics(st)
+        self.assertIn('omlx_build_info{version="0.7.1.dev1"} 1', lines)
+        self.assertIn("omlx_status_up 1", lines)
+
+    def test_failure_keeps_last_version_and_reports_down(self):
+        param_proxy.refresh_omlx_status(get=lambda: {"version": "0.7.1.dev1"}, now=1000.0)
+        def boom():
+            raise RuntimeError("connection refused")
+        st = param_proxy.refresh_omlx_status(get=boom, now=1100.0)
+        lines = param_proxy.render_omlx_metrics(st)
+        self.assertIn("omlx_status_up 0", lines)
+        self.assertIn('omlx_build_info{version="0.7.1.dev1"} 1', lines)
+
+    def test_never_known_emits_no_build_info(self):
+        st = param_proxy.refresh_omlx_status(get=lambda: {"status": "ok"}, now=1000.0)
+        lines = param_proxy.render_omlx_metrics(st)
+        self.assertIn("omlx_status_up 0", lines)
+        self.assertFalse(any(l.startswith("omlx_build_info{") for l in lines))
+
+    def test_label_value_is_escaped(self):
+        lines = param_proxy.render_omlx_metrics({"ok": True, "version": 'a"b\\c'})
+        self.assertIn('omlx_build_info{version="a\\"b\\\\c"} 1', lines)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

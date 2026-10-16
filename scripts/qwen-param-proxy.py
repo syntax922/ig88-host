@@ -338,6 +338,65 @@ def record_family(family: str, elapsed: float):
         _family_latency_count[family] += 1
 
 
+# oMLX build info — so "what version is ig88 running?" is answerable from
+# Prometheus (and therefore from k8s-mcp's prom_query) without any agent
+# needing a LAN path to ig88. Read from oMLX's own /api/status, cached so a
+# scrape never costs more than one short upstream call per OMLX_STATUS_TTL_S.
+OMLX_STATUS_TTL_S = 60
+OMLX_STATUS_TIMEOUT_S = 2.0
+_omlx_status = {"version": None, "fetched_at": 0.0, "ok": False}
+_omlx_status_lock = threading.Lock()
+
+
+def _prom_label_value(v) -> str:
+    return str(v).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
+
+def refresh_omlx_status(get=None, now=None):
+    """Refresh the cached oMLX version if the cache is older than the TTL.
+
+    Returns the cache dict. Keeps the last known version on failure and
+    records ok=False, so a brief oMLX restart does not erase the series.
+    """
+    now = time.time() if now is None else now
+    with _omlx_status_lock:
+        if now - _omlx_status["fetched_at"] < OMLX_STATUS_TTL_S:
+            return dict(_omlx_status)
+        _omlx_status["fetched_at"] = now
+    try:
+        if get is None:
+            resp = _upstream_client.get("/api/status", timeout=OMLX_STATUS_TIMEOUT_S)
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            data = get()
+        version = data.get("version")
+        ok = bool(version)
+    except Exception as e:
+        log.warning("omlx /api/status fetch failed: %s", e)
+        version, ok = None, False
+    with _omlx_status_lock:
+        if ok:
+            _omlx_status["version"] = version
+        _omlx_status["ok"] = ok
+        return dict(_omlx_status)
+
+
+def render_omlx_metrics(status) -> list:
+    lines = [
+        "# HELP omlx_status_up Whether the last oMLX /api/status read succeeded.",
+        "# TYPE omlx_status_up gauge",
+        "omlx_status_up %d" % (1 if status.get("ok") else 0),
+    ]
+    if status.get("version"):
+        lines += [
+            "# HELP omlx_build_info oMLX server version on ig88 (value is always 1).",
+            "# TYPE omlx_build_info gauge",
+            'omlx_build_info{version="%s"} 1' % _prom_label_value(status["version"]),
+        ]
+    return lines
+
+
 def render_family_metrics() -> bytes:
     with _metrics_lock:
         requests = dict(_family_requests)
@@ -356,6 +415,7 @@ def render_family_metrics() -> bytes:
     for fam in sorted(lat_count):
         lines.append('paramproxy_upstream_seconds_sum{family="%s"} %g' % (fam, lat_sum[fam]))
         lines.append('paramproxy_upstream_seconds_count{family="%s"} %d' % (fam, lat_count[fam]))
+    lines += render_omlx_metrics(refresh_omlx_status())
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
